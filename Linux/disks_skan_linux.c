@@ -16,7 +16,7 @@
 #include <scsi/sg.h>
 
 //TODO:LoadGroups, FindSmartByte, FindDefaultSmartByte - Перепроверить/подкорректировать работу функции, дописать комментарии. Избавиться от магических чисел. Учесть, что функция не очень хорошо учитывает пробелы при чтении значений ключа в файле. По возможности сократить кол-во операций 'strlen' и 'TrimString'
-//TODO: SdScan - добавить получение значения SMART по прочитанным байтам. Для этого определиться со способом интерпретации номера атрибута и отступа в таблице SMART (каждый атрибут занимает 12 байт).
+//TODO: SdScan - добавить получение значения SMART по прочитанным байтам.
 
 #define DEV_PATH "/dev"
 #define MAX_PATH 256
@@ -28,7 +28,7 @@
 #define NVME_MN_START_BIT 24
 #define SG_ATA_16 0x85
 #define ATA_SMART_CMD 0xB0
-#define SMART_READ_DATA 0xD0 //альтернативный вариант получения таблицы, по сравнению с 0xD5
+#define SMART_READ_DATA 0xD0
 #define SMART_READ_LOG 0xD5
 #define SMART_CYL_LOW 0x4F
 #define SMART_CYL_HIGH 0xC2
@@ -174,7 +174,7 @@ char *FindGroupByModel(const char *model) {
 }
 
 
-int FindSmartByte (FILE * sata_dict, const char* profile_name, const char* attribute_name){
+int FindSmartByte (const char* profile_name, const char* attribute_name){
     if (sata_dict == NULL){
         fprintf(stderr, "Warning: 'FindSmartByte()' didnt recived file descriptor. This function stop its work.\n");
         return -1;
@@ -220,7 +220,7 @@ int FindSmartByte (FILE * sata_dict, const char* profile_name, const char* attri
 }
 
 
-int FindDefaultSmartByte (FILE * sata_dict, const char* attribute_name){
+int FindDefaultSmartByte (const char* attribute_name){
     if (sata_dict == NULL){
         fprintf(stderr, "Warning: 'FindDefaultSmartByte()' didnt recived file descriptor. This function stop its work.\n");
         return -1;
@@ -348,8 +348,8 @@ int SdScan(const char *path){
     bool only_zeros = true;
     bool only_ffs = true;
     for (int i = 0; i < SMART_DATA_SIZE_BYTES; i++) {
-        if (data[i] & 0xFF != 0) only_zeros = false;
-        if (data[i] & 0xFF != 0xFF) only_ffs = false;
+        if ((data[i] & 0xFF) != 0) only_zeros = false;
+        if ((data[i] & 0xFF) != 0xFF) only_ffs = false;
         if (i % 16 == 0) printf("\n    %03X: ", i);
         printf("%02X ", data[i]);
         checksum += data[i];
@@ -357,38 +357,38 @@ int SdScan(const char *path){
     printf("\n");
     printf("    Checksum=%d\n", checksum);
     if (checksum != 0 || only_zeros || only_ffs){
-        fprintf(stderr, "Warning: Invalid checksum of SMART table. Result will be incorrect.\n");
+        fprintf(stderr, "Warning: Invalid checksum or other parameters of SMART table. Result will be incorrect.\n");
     }
 
     char* profile_name = FindGroupByModel(id.model);
-    int Err_Seek = -1;
-    int Rel_Sec_Count = -1;
+    int Seek_Error = -1;
+    int Reallocated_Sectors_Count = -1;
     if (profile_name != NULL){
-        Err_Seek = FindSmartByte(sata_dict, profile_name, "Err_Seek");
-        if (Err_Seek < 0){
-            fprintf(stderr, "Warning: 'FindSmartByte()' function cant return correct value for 'Err_Seek'. Using default profile. Result may be incorrect.\n");
-            Err_Seek = FindDefaultSmartByte(sata_dict, "Err_Seek");
+        Seek_Error = FindSmartByte(profile_name, "Seek_Error");
+        if (Seek_Error < 0){
+            fprintf(stderr, "Warning: 'FindSmartByte()' function cant return correct value for 'Seek_Error'. Using default profile. Result may be incorrect.\n");
+            Seek_Error = FindDefaultSmartByte("Seek_Error");
         }
-        if (Err_Seek < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Err_Seek'. Result will be incorrect.\n");
+        if (Seek_Error < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Seek_Error'. Result will be incorrect.\n");
 
-        Rel_Sec_Count = FindSmartByte(sata_dict, profile_name, "Rel_Sec_Count");
-        if (Rel_Sec_Count < 0){
-            fprintf(stderr, "Warning: 'FindSmartByte()' function cant return correct value for 'Rel_Sec_Count'. Using default profile. Result may be incorrect.\n");
-            Rel_Sec_Count = FindDefaultSmartByte(sata_dict, "Rel_Sec_Count");
+        Reallocated_Sectors_Count = FindSmartByte(profile_name, "Reallocated_Sectors_Count");
+        if (Reallocated_Sectors_Count < 0){
+            fprintf(stderr, "Warning: 'FindSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Using default profile. Result may be incorrect.\n");
+            Reallocated_Sectors_Count = FindDefaultSmartByte("Reallocated_Sectors_Count");
         }
-        if (Rel_Sec_Count  < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Rel_Sec_Count'. Result will be incorrect.\n");
+        if (Reallocated_Sectors_Count  < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Result will be incorrect.\n");
     } else {
         fprintf(stderr, "Warning: didnt find profile for '%s' in 'sata_dict.ini'. Result may be incorrect.\n", id.model);
 
-        Err_Seek = FindDefaultSmartByte(sata_dict, "Err_Seek");
-        if (Err_Seek < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Err_Seek'. Result will be incorrect.\n");
+        Seek_Error = FindDefaultSmartByte("Seek_Error");
+        if (Seek_Error < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Seek_Error'. Result will be incorrect.\n");
 
-        Rel_Sec_Count = FindDefaultSmartByte(sata_dict, "Rel_Sec_Count");
-        if (Rel_Sec_Count  < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Rel_Sec_Count'. Result will be incorrect.\n");
+        Reallocated_Sectors_Count = FindDefaultSmartByte("Reallocated_Sectors_Count");
+        if (Reallocated_Sectors_Count  < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Result will be incorrect.\n");
     }
 
-    printf("  Err_Seek=%d\n", Err_Seek);
-    printf("  Rel_Sec_Count=%d\n", Rel_Sec_Count);
+    printf("  Seek_Error=%d\n", Seek_Error);
+    printf("  Reallocated_Sectors_Count=%d\n", Reallocated_Sectors_Count);
     printf("\n");
     close(fd);
 }
