@@ -1,12 +1,11 @@
-#define INITGUID
 #include <stdio.h>
 #include <windows.h>
-#include <winioctl.h>
 #include <setupapi.h>
 #include <initguid.h>
 #include <ntddstor.h>
 #include <ntddscsi.h>
 #include <stdbool.h>
+#include <winioctl.h>
 
 //minimum Windows version: Windows 10 (IOCTL_STORAGE_PROTOCOL_COMMAND requironment)
 
@@ -21,6 +20,8 @@
 #define SMART_CYL_LOW 0x4F
 #define SMART_CYL_HIGH 0xC2
 #define SMART_DATA_SIZE_BYTES 512
+#define SMART_DATA_SIZE_DWORDS 128
+#define SMART_LID 0x02
 
 #define MAX_GROUPS 64
 #define MAX_MODELS 16
@@ -48,12 +49,16 @@ typedef struct SCSI_PASS_THROUGH_WITH_BUFFERS {
 
 
 //Структура объединяет в себе 'STORAGE_PROTOCOL_COMMAND' с буфферами, отступ к которым указан в полях 'STORAGE_PROTOCOL_COMMAND'
+//pragma pack используется для временного отключения выравнивания полей структуры из-за необходимости плотного расположения полей 'spc' и 'spcCommandField', второе из которых по сути является продолжением поля 'spc.Command'
+#pragma pack(push, 1)
 typedef struct STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS{
     STORAGE_PROTOCOL_COMMAND spc;
+    BYTE spcCommandField[64];
     UCHAR ErrorInfo[4096];
     UCHAR DataToDeviceBuffer[4096];
     UCHAR DataFromDeviceBuffer[4096];
 } STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS;
+#pragma pack(pop)
 
 
 //Эта функция избавляется от лишних пробелов в начале и конце строки '*str'.
@@ -61,9 +66,10 @@ typedef struct STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS{
 //Пример:
 //char str[7] = "  abc   ";
 //TrimString(str, strlen(str)+1) <- эквивалентно записи 'str = "abc"'.
-void TrimString(char *str, size_t size) {
-    for (size_t i = size - 1; i >= 0 && isspace((unsigned char)str[i]); --i) {
-        str[i] = '\0';
+void TrimString(char *str) {
+    size_t size = strlen(str)+1;
+    for (size_t i = size - 2; i >= 0 && isspace((unsigned char)str[i]); --i) {
+        str[i] = '\0';//если строка неизменяемая, то получаем runtime error
     }
 
     char *start = str;
@@ -90,7 +96,7 @@ void LoadGroups(FILE * sata_dict) {
     char line[MAX_STRING_LEN];
     bool in_groups_section = false;
     while (fgets(line, sizeof(line), sata_dict)) {
-        TrimString(line, strlen(line)+1);
+        TrimString(line);
         if (line[0] == ';' || line[0] == '#') continue;
         if (line[0] == '[') {
             if (!in_groups_section){
@@ -110,8 +116,9 @@ void LoadGroups(FILE * sata_dict) {
         char *group_name = line;
         char *models_str = equivalent + 1;
 
-        TrimString(group_name, strlen(group_name)+1);
-        TrimString(models_str, strlen(models_str)+1);
+        TrimString(group_name);
+        TrimString(models_str);
+        //printf("line:\"%s\"\n", group_name);
 
         if (model_group_count >= MAX_GROUPS) {
             fprintf(stderr, "Group count exceeded MAX_GROUPS value.");
@@ -126,7 +133,7 @@ void LoadGroups(FILE * sata_dict) {
         char *token = strtok(models_str, ",\"");
         while (token && g->model_count < MAX_MODELS) {
             int token_length = strlen(token)+1;
-            TrimString(token, token_length);
+            TrimString(token);
             g->models[g->model_count] = malloc(token_length);
             strncpy(g->models[g->model_count++], token, token_length);
             token = strtok(NULL, ",\"");
@@ -137,6 +144,48 @@ void LoadGroups(FILE * sata_dict) {
 
 
 //Эта функция возвращает поле 'name' структуры 'Group', которая содержит указанную модель диска '*model'
+//В данном варианте реализован поиск по наибольшему префиксу '*model', который имеется в списке 'Group' без учета регистра (заглавная/строчная буква)
+char *FindGroupByModel(const char *model) {
+    int target_model_strlen = strlen(model);
+    int max_prefix_len = 0; //максимальная длинна названия модели в файле, которая является префиксом целевого названия модели
+    int max_prefix_len_group = -1;
+    int model_index = 0;
+    for (int i = 0; i < model_group_count; i++) {
+        for (int j = 0; j < model_groups[i].model_count; j++) {
+            int current_prefix = 0;
+            int infile_model_strlen = strlen(model_groups[i].models[j]);
+
+            if (infile_model_strlen > target_model_strlen){
+                continue;
+            }
+
+            for (int k = 0; k < infile_model_strlen; k++){
+                if(model_groups[i].models[j][k] != model[k]){
+                    current_prefix = 0;
+                    break;
+                }
+                current_prefix++;
+            }
+
+            if (current_prefix > max_prefix_len){
+                max_prefix_len_group = i;
+                max_prefix_len = current_prefix;
+                model_index = j;
+            }
+        }
+    }
+
+    if (max_prefix_len > 0){
+        printf("returned model: %s\n", model_groups[max_prefix_len_group].models[model_index]);
+        return model_groups[max_prefix_len_group].name;
+    }
+
+    return NULL;
+}
+
+//Эта функция возвращает поле 'name' структуры 'Group', которая содержит указанную модель диска '*model'
+//В данном варианте реализован поиск модели по точному совпадению
+/*
 char *FindGroupByModel(const char *model) {
     for (int i = 0; i < model_group_count; i++) {
         for (int j = 0; j < model_groups[i].model_count; j++) {
@@ -147,6 +196,7 @@ char *FindGroupByModel(const char *model) {
     }
     return NULL;
 }
+*/
 
 
 int FindSmartByte (const char* profile_name, const char* attribute_name){
@@ -162,7 +212,7 @@ int FindSmartByte (const char* profile_name, const char* attribute_name){
     int profile_name_len = strlen(profile_name)+1;
     int attribute_name_len = strlen(attribute_name)+1;
     while (fgets(line, sizeof(line), sata_dict)) {
-        TrimString(line, strlen(line)+1);
+        TrimString(line);
         if (line[0] == ';' || line[0] == '#') continue;
         if (line[0] == '[') {
             if (!in_profile_section){
@@ -181,8 +231,8 @@ int FindSmartByte (const char* profile_name, const char* attribute_name){
         char *file_attribute_name = line;
         char *file_attribute_byte = equivalent + 1;
 
-        TrimString(file_attribute_name, strlen(file_attribute_name)+1);
-        TrimString(file_attribute_byte, strlen(file_attribute_byte)+1);
+        TrimString(file_attribute_name);
+        TrimString(file_attribute_byte);
 
         if (strncmp(file_attribute_name, attribute_name, attribute_name_len) == 0){
             sscanf(file_attribute_byte, "%d", &byte);
@@ -207,7 +257,7 @@ int FindDefaultSmartByte (const char* attribute_name){
     bool in_profile_section = false;
     int attribute_name_len = strlen(attribute_name)+1;
     while (fgets(line, sizeof(line), sata_dict)) {
-        TrimString(line, strlen(line)+1);
+        TrimString(line);
         if (line[0] == ';' || line[0] == '#') continue;
         if (line[0] == '[') {
             if (!in_profile_section){
@@ -226,8 +276,8 @@ int FindDefaultSmartByte (const char* attribute_name){
         char *file_attribute_name = line;
         char *file_attribute_byte = equivalent + 1;
 
-        TrimString(file_attribute_name, strlen(file_attribute_name)+1);
-        TrimString(file_attribute_byte, strlen(file_attribute_byte)+1);
+        TrimString(file_attribute_name);
+        TrimString(file_attribute_byte);
 
         if (strncmp(file_attribute_name, attribute_name, attribute_name_len) == 0){
             sscanf(file_attribute_byte, "%d", &byte);
@@ -366,68 +416,96 @@ int NvmeScan(HANDLE handle, const char *model){
         return -1;
     }
 
+    /*
     STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS spcwb = {0};
     STORAGE_PROTOCOL_COMMAND *spc = &spcwb.spc;
 
     spc->Version = STORAGE_PROTOCOL_STRUCTURE_VERSION;
     spc->Length = sizeof(STORAGE_PROTOCOL_COMMAND);
     spc->ProtocolType = ProtocolTypeNvme;
-    spc->Flags = STORAGE_PROTOCOL_COMMAND_FLAG_ADAPTER_REQUEST;
+    spc->Flags = 0;//STORAGE_PROTOCOL_COMMAND_FLAG_ADAPTER_REQUEST;
     spc->CommandLength = 64;
     spc->ErrorInfoLength = sizeof(spcwb.ErrorInfo);
-    spc->DataToDeviceTransferLength = sizeof(spcwb.DataToDeviceBuffer);
+    //spc->DataToDeviceTransferLength = 0;
     spc->DataFromDeviceTransferLength = sizeof(spcwb.DataFromDeviceBuffer);
     spc->TimeOutValue = 10;
     spc->ErrorInfoOffset = offsetof(STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS, ErrorInfo);
-    spc->DataToDeviceBufferOffset = offsetof(STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS, DataToDeviceBuffer);
+    //spc->DataToDeviceBufferOffset = offsetof(STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS, DataToDeviceBuffer);
     spc->DataFromDeviceBufferOffset = offsetof(STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS, DataFromDeviceBuffer);
 
     //структура command_field задается в NVM Express® Base Specification в таблице 92: Common Command Format
     UCHAR *command_field = spc->Command;
-    memset(command_field, 0, 64);//<--------------------------------------выход за пределы памяти?
+    memset(command_field, 0, 64);//<-выход за пределы памяти? Нет, т. к. в структуре 'STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS' с использованием pragma pack сразу за полем spc->Command идет поле spcCommandField[64], в котором будет содержаться вся команда.
 
-    /*
-    cmd.opcode = NVME_ADMIN_GET_LOG_PAGE;//<-----------------------поле opcode имеет
-    cmd.nsid = 0xFFFFFFFF;
-    cmd.addr = (uint64_t)&smart_log;
-    cmd.data_len = sizeof(smart_log);
-    cmd.cdw10 = ((SMART_DATA_SIZE_DWORDS & 0xFFFF) << 16) | (SMART_LID & 0xFF);
+    command_field[0] = NVME_ADMIN_GET_LOG_PAGE & 0xFF;
+    *(ULONG*)(&command_field[4]) = 0xFFFFFFFF;
+    //((ULONGLONG*)(&command_field[24]))[0] = (ULONGLONG)spcwb.DataFromDeviceBuffer;
+    *(ULONG*)(&command_field[40]) = ((SMART_DATA_SIZE_DWORDS & 0xFFFF) << 16) | (SMART_LID & 0xFF);
+    */
 
-    if (!DeviceIoControl(handle, IOCTL_STORAGE_PROTOCOL_COMMAND, &protocolCmd, ...)) {
-        fprintf(stderr, "[DeviceIoControl] IOCTL_STORAGE_PROTOCOL_COMMAND failed. Errcode: %lu\n", GetLastError());
+    DWORD command_length = 64;
+    DWORD error_info_length = 4096;
+    DWORD data_from_device_transfer_length = 512;
+    DWORD total_size = sizeof(STORAGE_PROTOCOL_COMMAND) + command_length + error_info_length + data_from_device_transfer_length;
+
+    PSTORAGE_PROTOCOL_COMMAND spc = (PSTORAGE_PROTOCOL_COMMAND)calloc(1, total_size);
+    UCHAR* data_from_device_buffer_pointer = (UCHAR*)spc + sizeof(STORAGE_PROTOCOL_COMMAND) + command_length + error_info_length;
+
+    spc->Version = STORAGE_PROTOCOL_STRUCTURE_VERSION;
+    spc->Length = sizeof(STORAGE_PROTOCOL_COMMAND);
+    spc->ProtocolType = ProtocolTypeNvme;
+    spc->Flags = 0;
+    spc->CommandLength = command_length;
+    spc->ErrorInfoLength = error_info_length;
+    spc->DataFromDeviceTransferLength = data_from_device_transfer_length;
+    spc->TimeOutValue = 10;
+    spc->ErrorInfoOffset = sizeof(STORAGE_PROTOCOL_COMMAND) + command_length;
+    spc->DataFromDeviceBufferOffset = sizeof(STORAGE_PROTOCOL_COMMAND) + command_length + error_info_length;
+
+    //структура command_field задается в NVM Express® Base Specification в таблице 92: Common Command Format
+    UCHAR* command_field = spc->Command;
+    memset(command_field, 0, 64);//<-выход за пределы памяти? Нет, т. к. в структуре 'STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS' с использованием pragma pack сразу за полем spc->Command идет поле spcCommandField[64], в котором будет содержаться вся команда.
+
+    command_field[0] = NVME_ADMIN_GET_LOG_PAGE & 0xFF;
+    *(ULONG*)(&command_field[4]) = 0xFFFFFFFF;
+    *(ULONG*)(&command_field[40]) = ((SMART_DATA_SIZE_DWORDS & 0xFFFF) << 16) | (SMART_LID & 0xFF);
+
+    DWORD returned = 0;
+    if (!DeviceIoControl(handle, IOCTL_STORAGE_PROTOCOL_COMMAND, spc, total_size, spc, total_size, &returned, NULL)) {//--------------------возникает ошибка 87: ERROR_INVALID_PARAMETER
+        fprintf(stderr, "[DeviceIoControl] IOCTL_STORAGE_PROTOCOL_COMMAND failed. Errcode: %lu\n[DeviceIoControl] Status: %x\n[DeviceIoControl] SPC Errcode: %x\n", GetLastError(), spc->ReturnStatus, spc->ErrorCode);
         return -1;
     }
 
     printf("  SMART data:");
     for (int i = 0; i < SMART_DATA_SIZE_BYTES; i++) {
         if (i % 16 == 0) printf("\n    %03X: ", i);
-        printf("%02X ", smart_log[i]);
+        printf("%02X ", data_from_device_buffer_pointer[i]);
     }
 
     printf("\n  SMART status: ");
-    if ((smart_log[0] & 0xFF) != 0x0){
+    if ((data_from_device_buffer_pointer[0] & 0xFF) != 0x0){
         printf("not ok.\n");
-        printf("    Critical Warning byte=0x%X. Problems:\n", smart_log[0]);
+        printf("    Critical Warning byte=0x%X. Problems:\n", data_from_device_buffer_pointer[0]);
         
-        if((smart_log[0] & 0x1) == 0x1){
+        if((data_from_device_buffer_pointer[0] & 0x1) == 0x1){
             printf("      Available Spare Capacity Below Threshold (ASCBT)\n");
         }
-        if((smart_log[0] & (0x1 << 1)) == 0x1){
+        if((data_from_device_buffer_pointer[0] & (0x1 << 1)) == 0x1){
             printf("      Temperature Threshold Condition (TTC)\n");
         }
-        if((smart_log[0] & (0x1 << 2)) == 0x1){
+        if((data_from_device_buffer_pointer[0] & (0x1 << 2)) == 0x1){
             printf("      NVM Subsystem Degraded Reliability (NDR)\n");
         }
-        if((smart_log[0] & (0x1 << 3)) == 0x1){
+        if((data_from_device_buffer_pointer[0] & (0x1 << 3)) == 0x1){
             printf("      All Media Read-Only (AMRO)\n");
         }
-        if((smart_log[0] & (0x1 << 4)) == 0x1){
+        if((data_from_device_buffer_pointer[0] & (0x1 << 4)) == 0x1){
             printf("      Volatile Memory Backup Failed (VMBF)\n");
         }
-        if((smart_log[0] & (0x1 << 5)) == 0x1){
+        if((data_from_device_buffer_pointer[0] & (0x1 << 5)) == 0x1){
             printf("      Persistent Memory Region Read-Only (PMRRO)\n");
         }
-        if((smart_log[0] & (0x1 << 6)) == 0x1){
+        if((data_from_device_buffer_pointer[0] & (0x1 << 6)) == 0x1){
             printf("      Indeterminate Personality State (IPS)\n");
         }
     } else {
@@ -435,8 +513,6 @@ int NvmeScan(HANDLE handle, const char *model){
     }
 
     printf("\n");
-    close(fd);
-    */
 }
 
 
@@ -461,7 +537,7 @@ int main() {
     ifData.cbSize = sizeof(ifData);
     printf("Scanning disks...\n\n");
     for (DWORD i = 0; SetupDiEnumDeviceInterfaces(hDevInfo, NULL, &GUID_DEVINTERFACE_DISK, i, &ifData); ++i){
-        printf("Disk %lu:\n", i);
+        printf("\nDisk %lu:\n", i);
         DWORD required = 0;
         SetupDiGetDeviceInterfaceDetail(hDevInfo, &ifData, NULL, 0, &required, NULL);
         PSP_DEVICE_INTERFACE_DETAIL_DATA pDetail = (PSP_DEVICE_INTERFACE_DETAIL_DATA)malloc(required);
@@ -475,8 +551,11 @@ int main() {
 
         HANDLE handle = CreateFile(pDetail->DevicePath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
         if (handle == INVALID_HANDLE_VALUE) {
-            fprintf(stderr, "[CreateFile] failed. DevicePath: %S\n Errcode: %lu\n",pDetail->DevicePath, GetLastError());
+            fprintf(stderr, "[CreateFile] failed. Errcode: %lu\nDevicePath: %S\n", GetLastError(), pDetail->DevicePath);
             free(pDetail);
+            if (GetLastError() == 5){
+                fprintf(stderr, "If Errcode=5, programm hasn't got permission to do this operation. Probably, you should start this programm in admin mode.\n");
+            }
             continue;
         }
 
@@ -495,6 +574,9 @@ int main() {
             char *rev    = desc->ProductRevisionOffset ? (char*)buf + desc->ProductRevisionOffset : NULL;
             char *serial = desc->SerialNumberOffset    ? (char*)buf + desc->SerialNumberOffset    : NULL;
             STORAGE_BUS_TYPE BusType = desc->BusType   ? desc->BusType                            : 0x00;
+
+            TrimString(model);
+            TrimString(serial);
             
             printf("  Model   : %s\n",  model);
             printf("  Serial  : %s\n",  serial);
@@ -516,14 +598,14 @@ int main() {
             else if (BusType == BusTypeVirtual)  printf("Virtual\n");
             else if (BusType == BusTypeFileBackedVirtual)  printf("FileBackendVirtual\n");
             else if (BusType == BusTypeSpaces)  printf("Spaces\n");
-            else if (BusType == BusTypeNvme)  printf("NVMe\n");
+            else if (BusType == BusTypeNvme)  {printf("NVMe\n"); NvmeScan(handle, model);}
             else if (BusType == BusTypeSCM)  printf("SCM\n");
             else if (BusType == BusTypeUfs)  printf("UFS\n");
             else if (BusType == BusTypeMax)  printf("MAX\n");
             else printf("unsupported value\n");
         }
         else {
-            fprintf(stderr, "IOCTL_STORAGE_QUERY_PROPERTY failed. Errcode: %lu\n", GetLastError());
+            fprintf(stderr, "[DeviceIoControl] IOCTL_STORAGE_QUERY_PROPERTY failed. Errcode: %lu\n", GetLastError());
         }
 
         CloseHandle(handle);
@@ -532,7 +614,7 @@ int main() {
     }
 
     if (GetLastError() != ERROR_NO_MORE_ITEMS){
-        fprintf(stderr, "SetupDiEnumDeviceInterfaces failed. Errcode: %lu\n", GetLastError());
+        fprintf(stderr, "[SetupDiEnumDeviceInterfaces] failed. Errcode: %lu\n", GetLastError());
     }
     
     SetupDiDestroyDeviceInfoList(hDevInfo);
