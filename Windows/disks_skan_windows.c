@@ -6,9 +6,13 @@
 #include <ntddscsi.h>
 #include <stdbool.h>
 #include <winioctl.h>
+#include <assert.h>
+#include <nvme.h>
 
 //minimum Windows version: Windows 10 (IOCTL_STORAGE_PROTOCOL_COMMAND requironment)
 
+//TODO: Перепроверить вызов IOCTL_ATA_PASS_THROUGH для получения статуса SMART для SATA
+//TODO: Попробовать переписать для SATA вызов Smart Read Data с использованием IOCTL_ATA_PASS_THROUGH
 //TODO: IOCTL_STORAGE_QUERY_PROPERTY - посмотреть все варианты возвращаемых байтов при успешном и неуспешном запросе и переписать структуры, которые принимают эти байты.
 //TODO: Реализовать неточный поиск модели в файле. Для этого, как вариант, удалять символы из полученной строки до тех пор, пока не встретим первое совпадение.
 //TODO: Реализовать получение значения SMART таблицы по байтам из справочника
@@ -17,6 +21,8 @@
 #define ATA_SMART_CMD 0xB0
 #define NVME_ADMIN_GET_LOG_PAGE 0x02
 #define SMART_READ_DATA 0xD0
+#define SMART_RETURN_STATUS 0xB0
+#define SMART_RETURN_STATUS_FEATURE 0xDA
 #define SMART_CYL_LOW 0x4F
 #define SMART_CYL_HIGH 0xC2
 #define SMART_DATA_SIZE_BYTES 512
@@ -402,6 +408,45 @@ int SataScan(HANDLE handle, const char *model){
         if (Reallocated_Sectors_Count  < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Result will be incorrect.\n");
     }
 
+
+
+    BYTE buffer[sizeof(ATA_PASS_THROUGH_EX) + 512];
+    memset(buffer, 0, sizeof(buffer));
+
+    ATA_PASS_THROUGH_EX *pt = (ATA_PASS_THROUGH_EX*)buffer;
+    pt->Length = sizeof(ATA_PASS_THROUGH_EX);
+    pt->TimeOutValue = 5;
+    pt->AtaFlags = ATA_FLAGS_DRDY_REQUIRED;
+
+    pt->CurrentTaskFile[0] = SMART_RETURN_STATUS_FEATURE;
+    pt->CurrentTaskFile[3] = 0x4F; // LBA Mid
+    pt->CurrentTaskFile[4] = 0xC2; // LBA High
+    pt->CurrentTaskFile[6] = SMART_RETURN_STATUS;
+
+    returned_bytes = 0;
+
+    if (!DeviceIoControl(handle,
+                         IOCTL_ATA_PASS_THROUGH,
+                         buffer, sizeof(buffer),
+                         buffer, sizeof(buffer),
+                         &returned_bytes, NULL))
+    {
+        fprintf(stderr, "[DeviceIoControl] IOCTL_ATA_PASS_THROUGH failed. Errcode: %lu\n", GetLastError());
+        return -1;
+    }
+
+    BYTE cyl_lo = pt->CurrentTaskFile[3];
+    BYTE cyl_hi = pt->CurrentTaskFile[4];
+    bool error_bit = pt->CurrentTaskFile[6] & 1;
+
+    if (error_bit)  fprintf(stderr, "[DeviceIoControl] IOCTL_ATA_PASS_THROUGH warning. Error bit = 1\n");
+    else if (cyl_lo == 0x4F && cyl_hi == 0xC2) printf("    SMART status: ok\n"); // OK
+    else if (cyl_lo == 0xF4 && cyl_hi == 0x2C) printf("    SMART status: not ok\n"); // FAIL
+    else  fprintf(stderr, "[DeviceIoControl] IOCTL_ATA_PASS_THROUGH warning. Undefined status: cyl_low = 0x%X, cyl_hi = 0x%X\n", cyl_lo, cyl_hi);
+    
+
+
+
     printf("  Seek_Error=%d\n", Seek_Error);
     printf("  Reallocated_Sectors_Count=%d\n", Reallocated_Sectors_Count);
     printf("\n");
@@ -412,100 +457,103 @@ int SataScan(HANDLE handle, const char *model){
 //В случае ошибки возвращает '-1'
 int NvmeScan(HANDLE handle, const char *model){
     if (handle == INVALID_HANDLE_VALUE) {
-        perror("Warning: function 'SataScan' got invalid handle value.\n");
+        perror("Warning: function 'NvmeScan' got invalid handle value.\n");
         return -1;
     }
 
-    /*
-    STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS spcwb = {0};
-    STORAGE_PROTOCOL_COMMAND *spc = &spcwb.spc;
+    DWORD returnedLength;
+    size_t bufferLength = max(sizeof(STORAGE_PROPERTY_QUERY) + sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA) + sizeof(NVME_HEALTH_INFO_LOG), sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR) + sizeof(NVME_HEALTH_INFO_LOG));
+    void* buffer = calloc(1, bufferLength);
+    PSTORAGE_PROPERTY_QUERY pquery = buffer;
+    PSTORAGE_PROTOCOL_DATA_DESCRIPTOR protocolDataDescr = buffer;
+    PSTORAGE_PROTOCOL_SPECIFIC_DATA protocolData = (PSTORAGE_PROTOCOL_SPECIFIC_DATA)pquery->AdditionalParameters;
 
-    spc->Version = STORAGE_PROTOCOL_STRUCTURE_VERSION;
-    spc->Length = sizeof(STORAGE_PROTOCOL_COMMAND);
-    spc->ProtocolType = ProtocolTypeNvme;
-    spc->Flags = 0;//STORAGE_PROTOCOL_COMMAND_FLAG_ADAPTER_REQUEST;
-    spc->CommandLength = 64;
-    spc->ErrorInfoLength = sizeof(spcwb.ErrorInfo);
-    //spc->DataToDeviceTransferLength = 0;
-    spc->DataFromDeviceTransferLength = sizeof(spcwb.DataFromDeviceBuffer);
-    spc->TimeOutValue = 10;
-    spc->ErrorInfoOffset = offsetof(STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS, ErrorInfo);
-    //spc->DataToDeviceBufferOffset = offsetof(STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS, DataToDeviceBuffer);
-    spc->DataFromDeviceBufferOffset = offsetof(STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS, DataFromDeviceBuffer);
+    pquery->PropertyId = StorageDeviceProtocolSpecificProperty;  
+    pquery->QueryType = PropertyStandardQuery;
 
-    //структура command_field задается в NVM Express® Base Specification в таблице 92: Common Command Format
-    UCHAR *command_field = spc->Command;
-    memset(command_field, 0, 64);//<-выход за пределы памяти? Нет, т. к. в структуре 'STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS' с использованием pragma pack сразу за полем spc->Command идет поле spcCommandField[64], в котором будет содержаться вся команда.
+    protocolData->ProtocolType = ProtocolTypeNvme;  
+    protocolData->DataType = NVMeDataTypeLogPage;  
+    protocolData->ProtocolDataRequestValue = NVME_LOG_PAGE_HEALTH_INFO;  
+    protocolData->ProtocolDataRequestSubValue = 0;  // This will be passed as the lower 32 bit of log page offset if controller supports extended data for the Get Log Page.
+    protocolData->ProtocolDataRequestSubValue2 = 0; // This will be passed as the higher 32 bit of log page offset if controller supports extended data for the Get Log Page.
+    protocolData->ProtocolDataRequestSubValue3 = 0; // This will be passed as Log Specific Identifier in CDW11.
+    protocolData->ProtocolDataRequestSubValue4 = 0; // This will map to STORAGE_PROTOCOL_DATA_SUBVALUE_GET_LOG_PAGE definition, then user can pass Retain Asynchronous Event, Log Specific Field.
 
-    command_field[0] = NVME_ADMIN_GET_LOG_PAGE & 0xFF;
-    *(ULONG*)(&command_field[4]) = 0xFFFFFFFF;
-    //((ULONGLONG*)(&command_field[24]))[0] = (ULONGLONG)spcwb.DataFromDeviceBuffer;
-    *(ULONG*)(&command_field[40]) = ((SMART_DATA_SIZE_DWORDS & 0xFFFF) << 16) | (SMART_LID & 0xFF);
-    */
+    protocolData->ProtocolDataOffset = sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA);  
+    protocolData->ProtocolDataLength = sizeof(NVME_HEALTH_INFO_LOG);
+    
+    int result = DeviceIoControl(handle,  
+                                IOCTL_STORAGE_QUERY_PROPERTY,  
+                                buffer,  
+                                bufferLength,  
+                                buffer, 
+                                bufferLength,  
+                                &returnedLength,  
+                                NULL);
 
-    DWORD command_length = 64;
-    DWORD error_info_length = 4096;
-    DWORD data_from_device_transfer_length = 512;
-    DWORD total_size = sizeof(STORAGE_PROTOCOL_COMMAND) + command_length + error_info_length + data_from_device_transfer_length;
-
-    PSTORAGE_PROTOCOL_COMMAND spc = (PSTORAGE_PROTOCOL_COMMAND)calloc(1, total_size);
-    UCHAR* data_from_device_buffer_pointer = (UCHAR*)spc + sizeof(STORAGE_PROTOCOL_COMMAND) + command_length + error_info_length;
-
-    spc->Version = STORAGE_PROTOCOL_STRUCTURE_VERSION;
-    spc->Length = sizeof(STORAGE_PROTOCOL_COMMAND);
-    spc->ProtocolType = ProtocolTypeNvme;
-    spc->Flags = 0;
-    spc->CommandLength = command_length;
-    spc->ErrorInfoLength = error_info_length;
-    spc->DataFromDeviceTransferLength = data_from_device_transfer_length;
-    spc->TimeOutValue = 10;
-    spc->ErrorInfoOffset = sizeof(STORAGE_PROTOCOL_COMMAND) + command_length;
-    spc->DataFromDeviceBufferOffset = sizeof(STORAGE_PROTOCOL_COMMAND) + command_length + error_info_length;
-
-    //структура command_field задается в NVM Express® Base Specification в таблице 92: Common Command Format
-    UCHAR* command_field = spc->Command;
-    memset(command_field, 0, 64);//<-выход за пределы памяти? Нет, т. к. в структуре 'STORAGE_PROTOCOL_COMMAND_WITH_BUFFERS' с использованием pragma pack сразу за полем spc->Command идет поле spcCommandField[64], в котором будет содержаться вся команда.
-
-    command_field[0] = NVME_ADMIN_GET_LOG_PAGE & 0xFF;
-    *(ULONG*)(&command_field[4]) = 0xFFFFFFFF;
-    *(ULONG*)(&command_field[40]) = ((SMART_DATA_SIZE_DWORDS & 0xFFFF) << 16) | (SMART_LID & 0xFF);
-
-    DWORD returned = 0;
-    if (!DeviceIoControl(handle, IOCTL_STORAGE_PROTOCOL_COMMAND, spc, total_size, spc, total_size, &returned, NULL)) {//--------------------возникает ошибка 87: ERROR_INVALID_PARAMETER
-        fprintf(stderr, "[DeviceIoControl] IOCTL_STORAGE_PROTOCOL_COMMAND failed. Errcode: %lu\n[DeviceIoControl] Status: %x\n[DeviceIoControl] SPC Errcode: %x\n", GetLastError(), spc->ReturnStatus, spc->ErrorCode);
+    if (!result || (returnedLength == 0)) {
+        fprintf(stderr, "[DeviceIoControl] IOCTL_STORAGE_QUERY_PROPERTY failed. Errcode: %lu\n \
+            [DeviceIoControl] result: %d\n \
+            [DeviceIoControl] returned length: %lu\n", 
+            GetLastError(), result, returnedLength);
+        free(buffer);
         return -1;
     }
+
+    if ((protocolDataDescr->Version != sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR)) || (protocolDataDescr->Size != sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR))) {
+        //printf("DeviceNVMeQueryProtocolDataTest: SMART/Health Information Log - data descriptor header not valid.\n");
+        fprintf(stderr, "[DeviceIoControl] IOCTL_STORAGE_QUERY_PROPERTY failed: data descriptor header not valid.\n \
+            [DeviceIoControl] data descriptor version: %lu (should be %lu)\n \
+            [DeviceIoControl] data descriptor size: %lu (should be %lu)\n",
+            protocolDataDescr->Version, sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR), protocolDataDescr->Size, sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR));
+        free(buffer);
+        return -1;
+    }
+
+    protocolData = &protocolDataDescr->ProtocolSpecificData;
+
+    if ((protocolData->ProtocolDataOffset < sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA)) || (protocolData->ProtocolDataLength < sizeof(NVME_HEALTH_INFO_LOG))) {
+        //printf("DeviceNVMeQueryProtocolDataTest: SMART/Health Information Log - ProtocolData Offset/Length not valid.\n");
+        fprintf(stderr, "[DeviceIoControl] IOCTL_STORAGE_QUERY_PROPERTY failed: ProtocolData Offset/Length not valid.\n \
+            [DeviceIoControl] protocolData offset: %lu (should be at least %lu)\n \
+            [DeviceIoControl] protocolData length: %lu (should be at least %lu)\n",
+            protocolData->ProtocolDataOffset, sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA), protocolData->ProtocolDataLength, sizeof(NVME_HEALTH_INFO_LOG));
+        free(buffer);
+        return -1;
+    }
+
+    PNVME_HEALTH_INFO_LOG smartInfo = (PNVME_HEALTH_INFO_LOG)((PCHAR)protocolData + protocolData->ProtocolDataOffset);
 
     printf("  SMART data:");
     for (int i = 0; i < SMART_DATA_SIZE_BYTES; i++) {
         if (i % 16 == 0) printf("\n    %03X: ", i);
-        printf("%02X ", data_from_device_buffer_pointer[i]);
+        printf("%02X ", ((UCHAR*)smartInfo)[i]);
     }
 
     printf("\n  SMART status: ");
-    if ((data_from_device_buffer_pointer[0] & 0xFF) != 0x0){
+    if ((((UCHAR*)smartInfo)[0] & 0xFF) != 0x0){
         printf("not ok.\n");
-        printf("    Critical Warning byte=0x%X. Problems:\n", data_from_device_buffer_pointer[0]);
+        printf("    Critical Warning byte=0x%X. Problems:\n", ((UCHAR*)smartInfo)[0]);
         
-        if((data_from_device_buffer_pointer[0] & 0x1) == 0x1){
+        if(smartInfo->CriticalWarning.AvailableSpaceLow){
             printf("      Available Spare Capacity Below Threshold (ASCBT)\n");
         }
-        if((data_from_device_buffer_pointer[0] & (0x1 << 1)) == 0x1){
+        if(smartInfo->CriticalWarning.TemperatureThreshold){
             printf("      Temperature Threshold Condition (TTC)\n");
         }
-        if((data_from_device_buffer_pointer[0] & (0x1 << 2)) == 0x1){
+        if(smartInfo->CriticalWarning.ReliabilityDegraded){
             printf("      NVM Subsystem Degraded Reliability (NDR)\n");
         }
-        if((data_from_device_buffer_pointer[0] & (0x1 << 3)) == 0x1){
+        if(smartInfo->CriticalWarning.ReadOnly){
             printf("      All Media Read-Only (AMRO)\n");
         }
-        if((data_from_device_buffer_pointer[0] & (0x1 << 4)) == 0x1){
+        if(smartInfo->CriticalWarning.VolatileMemoryBackupDeviceFailed){
             printf("      Volatile Memory Backup Failed (VMBF)\n");
         }
-        if((data_from_device_buffer_pointer[0] & (0x1 << 5)) == 0x1){
+        if((smartInfo->CriticalWarning.AsUchar & (0x1 << 5))){
             printf("      Persistent Memory Region Read-Only (PMRRO)\n");
         }
-        if((data_from_device_buffer_pointer[0] & (0x1 << 6)) == 0x1){
+        if((smartInfo->CriticalWarning.AsUchar & (0x1 << 6))){
             printf("      Indeterminate Personality State (IPS)\n");
         }
     } else {
@@ -513,6 +561,9 @@ int NvmeScan(HANDLE handle, const char *model){
     }
 
     printf("\n");
+    free(buffer);
+    return 0;
+    
 }
 
 

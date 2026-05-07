@@ -18,6 +18,8 @@
 //TODO:LoadGroups, FindSmartByte, FindDefaultSmartByte - Перепроверить/подкорректировать работу функции, дописать комментарии. Избавиться от магических чисел. Учесть, что функция не очень хорошо учитывает пробелы при чтении значений ключа в файле. По возможности сократить кол-во операций 'strlen' и 'TrimString'
 //TODO: SdScan - добавить получение значения SMART по прочитанным байтам.
 
+#define CDB_SIZE 16
+#define SENSE_SIZE 32
 #define DEV_PATH "/dev"
 #define MAX_PATH 256
 #define NVME_ADMIN_IDENTIFY 0x06
@@ -29,6 +31,7 @@
 #define SG_ATA_16 0x85
 #define ATA_SMART_CMD 0xB0
 #define SMART_READ_DATA 0xD0
+#define SMART_RETURN_STATUS 0xDA
 #define SMART_READ_LOG 0xD5
 #define SMART_CYL_LOW 0x4F
 #define SMART_CYL_HIGH 0xC2
@@ -71,10 +74,11 @@ Group model_groups[MAX_GROUPS];
 //Состояние '*str' при этом меняется в соответствии с работой функции.
 //Пример:
 //char str[7] = "  abc   ";
-//TrimString(str, strlen(str)+1) <- эквивалентно записи 'str = "abc"'.
-void TrimString(char *str, size_t size) {
-    for (ssize_t i = size - 1; i >= 0 && isspace((unsigned char)str[i]); --i) {
-        str[i] = '\0';
+//TrimString(str) <- эквивалентно записи 'str = "abc"'.
+void TrimString(char *str) {
+    size_t size = strlen(str)+1;
+    for (size_t i = size - 2; i >= 0 && isspace((unsigned char)str[i]); --i) {
+        str[i] = '\0';//если строка неизменяемая, то получаем runtime error
     }
 
     char *start = str;
@@ -115,7 +119,7 @@ void LoadGroups(FILE * sata_dict) {
     char line[MAX_STRING_LEN];
     bool in_groups_section = false;
     while (fgets(line, sizeof(line), sata_dict)) {
-        TrimString(line, strlen(line)+1);
+        TrimString(line);
         if (line[0] == ';' || line[0] == '#') continue;
         if (line[0] == '[') {
             if (!in_groups_section){
@@ -135,8 +139,8 @@ void LoadGroups(FILE * sata_dict) {
         char *group_name = line;
         char *models_str = equivalent + 1;
 
-        TrimString(group_name, strlen(group_name)+1);
-        TrimString(models_str, strlen(models_str)+1);
+        TrimString(group_name);
+        TrimString(models_str);
 
         if (model_group_count >= MAX_GROUPS) {
             fprintf(stderr, "Group count exceeded MAX_GROUPS value.");
@@ -151,7 +155,7 @@ void LoadGroups(FILE * sata_dict) {
         char *token = strtok(models_str, ",\"");
         while (token && g->model_count < MAX_MODELS) {
             int token_length = strlen(token)+1;
-            TrimString(token, token_length);
+            TrimString(token);
             g->models[g->model_count] = malloc(token_length);
             strncpy(g->models[g->model_count++], token, token_length);
             token = strtok(NULL, ",\"");
@@ -162,6 +166,48 @@ void LoadGroups(FILE * sata_dict) {
 
 
 //Эта функция возвращает поле 'name' структуры 'Group', которая содержит указанную модель диска '*model'
+//В данном варианте реализован поиск по наибольшему префиксу '*model', который имеется в списке 'Group' без учета регистра (заглавная/строчная буква)
+char *FindGroupByModel(const char *model) {
+    int target_model_strlen = strlen(model);
+    int max_prefix_len = 0; //максимальная длинна названия модели в файле, которая является префиксом целевого названия модели
+    int max_prefix_len_group = -1;
+    int model_index = 0;
+    for (int i = 0; i < model_group_count; i++) {
+        for (int j = 0; j < model_groups[i].model_count; j++) {
+            int current_prefix = 0;
+            int infile_model_strlen = strlen(model_groups[i].models[j]);
+
+            if (infile_model_strlen > target_model_strlen){
+                continue;
+            }
+
+            for (int k = 0; k < infile_model_strlen; k++){
+                if(model_groups[i].models[j][k] != model[k]){
+                    current_prefix = 0;
+                    break;
+                }
+                current_prefix++;
+            }
+
+            if (current_prefix > max_prefix_len){
+                max_prefix_len_group = i;
+                max_prefix_len = current_prefix;
+                model_index = j;
+            }
+        }
+    }
+
+    if (max_prefix_len > 0){
+        printf("returned model: %s\n", model_groups[max_prefix_len_group].models[model_index]);
+        return model_groups[max_prefix_len_group].name;
+    }
+
+    return NULL;
+}
+
+//Эта функция возвращает поле 'name' структуры 'Group', которая содержит указанную модель диска '*model'
+//В данном варианте реализован поиск модели по точному совпадению
+/*
 char *FindGroupByModel(const char *model) {
     for (int i = 0; i < model_group_count; i++) {
         for (int j = 0; j < model_groups[i].model_count; j++) {
@@ -172,6 +218,7 @@ char *FindGroupByModel(const char *model) {
     }
     return NULL;
 }
+*/
 
 
 int FindSmartByte (const char* profile_name, const char* attribute_name){
@@ -187,7 +234,7 @@ int FindSmartByte (const char* profile_name, const char* attribute_name){
     int profile_name_len = strlen(profile_name)+1;
     int attribute_name_len = strlen(attribute_name)+1;
     while (fgets(line, sizeof(line), sata_dict)) {
-        TrimString(line, strlen(line)+1);
+        TrimString(line);
         if (line[0] == ';' || line[0] == '#') continue;
         if (line[0] == '[') {
             if (!in_profile_section){
@@ -206,8 +253,8 @@ int FindSmartByte (const char* profile_name, const char* attribute_name){
         char *file_attribute_name = line;
         char *file_attribute_byte = equivalent + 1;
 
-        TrimString(file_attribute_name, strlen(file_attribute_name)+1);
-        TrimString(file_attribute_byte, strlen(file_attribute_byte)+1);
+        TrimString(file_attribute_name);
+        TrimString(file_attribute_byte);
 
         if (strncmp(file_attribute_name, attribute_name, attribute_name_len) == 0){
             sscanf(file_attribute_byte, "%d", &byte);
@@ -232,7 +279,7 @@ int FindDefaultSmartByte (const char* attribute_name){
     bool in_profile_section = false;
     int attribute_name_len = strlen(attribute_name)+1;
     while (fgets(line, sizeof(line), sata_dict)) {
-        TrimString(line, strlen(line)+1);
+        TrimString(line);
         if (line[0] == ';' || line[0] == '#') continue;
         if (line[0] == '[') {
             if (!in_profile_section){
@@ -251,8 +298,8 @@ int FindDefaultSmartByte (const char* attribute_name){
         char *file_attribute_name = line;
         char *file_attribute_byte = equivalent + 1;
 
-        TrimString(file_attribute_name, strlen(file_attribute_name)+1);
-        TrimString(file_attribute_byte, strlen(file_attribute_byte)+1);
+        TrimString(file_attribute_name);
+        TrimString(file_attribute_byte);
 
         if (strncmp(file_attribute_name, attribute_name, attribute_name_len) == 0){
             sscanf(file_attribute_byte, "%d", &byte);
@@ -279,8 +326,8 @@ int SdScan(const char *path){
     int rotation_rate;
     if (ioctl(fd, HDIO_GET_IDENTITY, &id) >= 0) {
         rotation_rate = id.words206_254[11];
-        TrimString(id.model, sizeof(id.model));
-        TrimString(id.serial_no, sizeof(id.serial_no));
+        TrimString(id.model);
+        TrimString(id.serial_no);
 
         printf("Device: %s\n", path);
         printf("  Model:         %.40s\n", id.model);
@@ -292,13 +339,13 @@ int SdScan(const char *path){
         return -1;
     }
 
-    unsigned char cdb[16] = {0};
-    unsigned char sense[32] = {0};
+    unsigned char cdb[CDB_SIZE] = {0};
+    unsigned char sense[SENSE_SIZE] = {0};
     unsigned char data[SMART_DATA_SIZE_BYTES] = {0};
 
     cdb[0] = SG_ATA_16;
     cdb[1] = (0x4 << 1);
-    cdb[2] = (1 << 3) | (0x2 << 2) | 1;
+    cdb[2] = (1 << 3) | (1 << 2) | 1;
     cdb[4] = SMART_READ_DATA;
     cdb[6] = 0x01;
     cdb[10] = SMART_CYL_LOW;
@@ -323,18 +370,18 @@ int SdScan(const char *path){
         close(fd);
         return -1;
     }
-
-    if ((io_hdr.info & SG_INFO_OK_MASK) != SG_INFO_OK) {
-        fprintf(stderr, "SG_IO error: status=%x, response code=%x\n", io_hdr.status, (sense[0] & 0x7F));
+    
+    if ((io_hdr.info & SG_INFO_OK_MASK) != SG_INFO_OK) { //описанов в SPC-3 (есть более поздние версии SPC, но они с закрытым доступом)
+        fprintf(stderr, "SG_IO error: status=0x%X, response code=0x%X\n", io_hdr.status, (sense[0] & 0x7F));
         if ((sense[0] & 0x7F) == 0x70 || (sense[0] & 0x7F) == 0x71){
-            printf("sense key=%x\n", (sense[1] & 0xF));
-            printf("additional sense code=%x\n", sense[12]);
-            printf("additional sense code qualifier=%x\n", sense[13]);
+            printf("sense key=0x%X\n", (sense[1] & 0xF));
+            printf("additional sense code=0x%X\n", sense[12]);
+            printf("additional sense code qualifier=0x%X\n", sense[13]);
             printf("For more information see official specification\n\n");
         } else if ((sense[0] & 0x7F) == 0x72 || (sense[0] & 0x7F) == 0x73){
-            printf("sense key=%x\n", (sense[1] & 0xF));
-            printf("additional sense code=%x\n", sense[2]);
-            printf("additional sense code qualifier=%x\n", sense[3]);
+            printf("sense key=0x%X\n", (sense[1] & 0xF));
+            printf("additional sense code=0x%X\n", sense[2]);
+            printf("additional sense code qualifier=0x%X\n", sense[3]);
             printf("For more information see official specification\n\n");
         } else{
             printf("returned unknown response code.\n\n");
@@ -342,6 +389,8 @@ int SdScan(const char *path){
         close(fd);
         return -1;
     }
+
+
 
     printf("  SMART data:");
     unsigned char checksum = 0;
@@ -358,6 +407,101 @@ int SdScan(const char *path){
     printf("    Checksum=%d\n", checksum);
     if (checksum != 0 || only_zeros || only_ffs){
         fprintf(stderr, "Warning: Invalid checksum or other parameters of SMART table. Result will be incorrect.\n");
+    }
+
+
+    memset(cdb, 0, sizeof(unsigned char[CDB_SIZE]));
+    memset(sense, 0, sizeof(unsigned char[SENSE_SIZE]));
+
+    cdb[0] = SG_ATA_16;
+    cdb[1] = (3 << 1);
+    cdb[2] = (1 << 5);
+    cdb[4] = SMART_RETURN_STATUS;
+    cdb[10] = SMART_CYL_LOW;
+    cdb[12] = SMART_CYL_HIGH;
+    cdb[14] = ATA_SMART_CMD;
+
+    memset(&io_hdr, 0, sizeof(io_hdr));
+
+    io_hdr.interface_id = 'S';
+    io_hdr.dxfer_direction = SG_DXFER_NONE;
+    io_hdr.cmdp = cdb;
+    io_hdr.cmd_len = sizeof(cdb);
+    //io_hdr.dxferp = data;
+    //io_hdr.dxfer_len = sizeof(data);
+    io_hdr.sbp = sense;
+    io_hdr.mx_sb_len = sizeof(sense);
+    io_hdr.timeout = 5000;
+
+    if (ioctl(fd, SG_IO, &io_hdr) < 0) {
+        perror("[ioctl SG_IO] returned negative value. Error");
+        close(fd);
+        return -1;
+    }
+
+    if ((io_hdr.info & SG_INFO_OK_MASK) != SG_INFO_CHECK) { //описанов в SPC-3 (есть более поздние версии SPC, но они с закрытым доступом)
+        fprintf(stderr, "SG_IO error: status=0x%X, response code=0%X\n", io_hdr.status, (sense[0] & 0x7F));
+        if ((sense[0] & 0x7F) == 0x70 || (sense[0] & 0x7F) == 0x71){
+            printf("sense key=0x%X\n", (sense[1] & 0xF));
+            printf("additional sense code=0x%X\n", sense[12]);
+            printf("additional sense code qualifier=0x%X\n", sense[13]);
+            printf("For more information see official specification\n\n");
+        } else if ((sense[0] & 0x7F) == 0x72 || (sense[0] & 0x7F) == 0x73){
+            printf("sense key=0x%X\n", (sense[1] & 0xF));
+            printf("additional sense code=0x%X\n", sense[2]);
+            printf("additional sense code qualifier=0x%X\n", sense[3]);
+            printf("For more information see official specification\n\n");
+        } else{
+            printf("returned unknown response code.\n\n");
+        }
+        close(fd);
+        return -1;
+    }
+
+    unsigned char response_code = (sense[0] & 0x7F);
+    unsigned char asc;
+    unsigned char ascq;
+    bool descriptor_format;
+    bool success = true;
+    if ((response_code == 0x70) || (response_code == 0x71)){
+        asc = sense[12];
+        ascq = sense[13];
+        descriptor_format = false;
+    } else if ((response_code == 0x72) || (response_code == 0x73)) {
+        asc = sense[2];
+        ascq = sense[3];
+        descriptor_format = true;
+    } else {
+        success = false;
+        printf("Warning: returned unknown response code=0x%X. Cant get SMART RETURN STATUS.\n\n", response_code);
+    }
+
+    if (success && ((asc != 0x0) || (ascq != 0x1D))){
+        success = false;
+        printf("Warning: returned unexpected sense codes:\n\tadditional sense code=0x%X\n\tadditional sense code qualifier=0x%X\n\tFor more information see official specification.\n\n", \
+            asc, ascq);
+    }
+
+    bool error_bit;
+    if (success){
+        for (int i = 8; i < io_hdr.sb_len_wr - 1; ) {
+            unsigned char desc = sense[i];
+            unsigned char desc_len  = sense[i+1];
+            if (desc == 0x09 && desc_len  >= 0x0c) {
+                unsigned char cyl_lo = sense[i + 9];
+                unsigned char cyl_hi = sense[i + 11];
+                error_bit = sense[i + 13] & 1;
+
+                if (error_bit) fprintf(stderr, "ioctl [SG_IO] warning. error bit = 1\n");
+                else if (cyl_lo == 0x4F && cyl_hi == 0xC2) printf("  SMART status: ok.\n"); // OK
+                else if (cyl_lo == 0xF4 && cyl_hi == 0x2C) printf("  SMART status: not ok.\n"); // FAIL
+                else  fprintf(stderr, "ioctl [SG_IO] warning. Undefined status: cyl_low = 0x%X, cyl_hi = 0x%X\n", cyl_lo, cyl_hi);
+                break;
+            }
+            i += desc_len  + 2;
+        }
+
+        
     }
 
     char* profile_name = FindGroupByModel(id.model);
@@ -419,8 +563,8 @@ int NvmeScan(const char *path){
 
         strncpy(nvme_serial, &buf[NVME_SN_START_BIT], NVME_SN_SIZE);
         strncpy(nvme_model, &buf[NVME_MN_START_BIT], NVME_MN_SIZE);
-        TrimString(nvme_serial, NVME_SN_SIZE);
-        TrimString(nvme_model, NVME_MN_SIZE);
+        TrimString(nvme_serial);
+        TrimString(nvme_model);
 
         printf("Device: %s\n", path);
         printf("  Model:  %.40s\n", nvme_model);
