@@ -15,6 +15,8 @@
 #include <stdbool.h>
 #include <scsi/sg.h>
 
+#include "crossplatform.h"
+
 //TODO:LoadGroups, FindSmartByte, FindDefaultSmartByte - Перепроверить/подкорректировать работу функции, дописать комментарии. Избавиться от магических чисел. Учесть, что функция не очень хорошо учитывает пробелы при чтении значений ключа в файле. По возможности сократить кол-во операций 'strlen' и 'TrimString'
 //TODO: SdScan - добавить получение значения SMART по прочитанным байтам.
 
@@ -30,12 +32,10 @@
 #define NVME_MN_START_BIT 24
 #define SG_ATA_16 0x85
 #define ATA_SMART_CMD 0xB0
-#define SMART_READ_DATA 0xD0
 #define SMART_RETURN_STATUS 0xDA
 #define SMART_READ_LOG 0xD5
 #define SMART_CYL_LOW 0x4F
 #define SMART_CYL_HIGH 0xC2
-#define SMART_DATA_SIZE_BYTES 512
 #define SMART_DATA_SIZE_DWORDS 128
 #define SMART_LID 0x02
 
@@ -390,8 +390,6 @@ int SdScan(const char *path){
         return -1;
     }
 
-
-
     printf("  SMART data:");
     unsigned char checksum = 0;
     bool only_zeros = true;
@@ -408,6 +406,79 @@ int SdScan(const char *path){
     if (checksum != 0 || only_zeros || only_ffs){
         fprintf(stderr, "Warning: Invalid checksum or other parameters of SMART table. Result will be incorrect.\n");
     }
+
+    SmartData smartData = {0};
+    loadSataSMARTAttributes(&smartData, data);
+
+
+
+    memset(data, 0, sizeof(data));
+    memset(cdb, 0, sizeof(unsigned char[CDB_SIZE]));
+    memset(sense, 0, sizeof(unsigned char[SENSE_SIZE]));
+
+    cdb[0] = SG_ATA_16;
+    cdb[1] = (0x4 << 1);
+    cdb[2] = (1 << 3) | (1 << 2) | 1;
+    cdb[4] = SMART_READ_THRESHOLDS;
+    cdb[6] = 0x01;
+    cdb[10] = SMART_CYL_LOW;
+    cdb[12] = SMART_CYL_HIGH;
+    cdb[14] = ATA_SMART_CMD;
+
+    memset(&io_hdr, 0, sizeof(io_hdr));
+
+    io_hdr.interface_id = 'S';
+    io_hdr.dxfer_direction = SG_DXFER_FROM_DEV;
+    io_hdr.cmdp = cdb;
+    io_hdr.cmd_len = sizeof(cdb);
+    io_hdr.dxferp = data;
+    io_hdr.dxfer_len = sizeof(data);
+    io_hdr.sbp = sense;
+    io_hdr.mx_sb_len = sizeof(sense);
+    io_hdr.timeout = 5000;
+
+    if (ioctl(fd, SG_IO, &io_hdr) < 0) {
+        perror("[ioctl SG_IO] returned negative value. Error");
+        close(fd);
+        return -1;
+    }
+    
+    if ((io_hdr.info & SG_INFO_OK_MASK) != SG_INFO_OK) { //описанов в SPC-3 (есть более поздние версии SPC, но они с закрытым доступом)
+        fprintf(stderr, "SG_IO error: status=0x%X, response code=0x%X\n", io_hdr.status, (sense[0] & 0x7F));
+        if ((sense[0] & 0x7F) == 0x70 || (sense[0] & 0x7F) == 0x71){
+            printf("sense key=0x%X\n", (sense[1] & 0xF));
+            printf("additional sense code=0x%X\n", sense[12]);
+            printf("additional sense code qualifier=0x%X\n", sense[13]);
+            printf("For more information see official specification\n\n");
+        } else if ((sense[0] & 0x7F) == 0x72 || (sense[0] & 0x7F) == 0x73){
+            printf("sense key=0x%X\n", (sense[1] & 0xF));
+            printf("additional sense code=0x%X\n", sense[2]);
+            printf("additional sense code qualifier=0x%X\n", sense[3]);
+            printf("For more information see official specification\n\n");
+        } else{
+            printf("returned unknown response code.\n\n");
+        }
+        close(fd);
+        return -1;
+    }
+
+    loadSataSMARTThresholds(&smartData, data);
+
+    for (size_t i = 0; i < SATA_SMART_ATTRIBUTES_COUNT; i++){
+        SataSMARTAttribute currentAttribute = smartData.attributes[i].attribute;
+        SataSMARTThreshold currentThreshold = smartData.attributes[i].threshold;
+        if (currentAttribute.id == 0){
+            if (currentThreshold.id != 0){
+                printf("WARNING: unexisted attribute has threshold id=%hu\n", currentThreshold.id);
+            }
+            continue;
+        }
+        printf("  attribute id(%hu):\timportant=%s\tvalue=%hu,\tworst=%hu\t", currentAttribute.id, (currentAttribute.flags[0] & 1) ? "true" : "false", currentAttribute.normalized, currentAttribute.worst);
+        if (currentThreshold.id == 0) printf("threshold=undefined\n");
+        else printf("threshold=%hu\n", currentThreshold.threshold);
+
+    }
+
 
 
     memset(cdb, 0, sizeof(unsigned char[CDB_SIZE]));
@@ -484,6 +555,7 @@ int SdScan(const char *path){
 
     bool error_bit;
     if (success){
+        printf("\n");
         for (int i = 8; i < io_hdr.sb_len_wr - 1; ) {
             unsigned char desc = sense[i];
             unsigned char desc_len  = sense[i+1];
@@ -504,6 +576,7 @@ int SdScan(const char *path){
         
     }
 
+    /*
     char* profile_name = FindGroupByModel(id.model);
     int Seek_Error = -1;
     int Reallocated_Sectors_Count = -1;
@@ -533,6 +606,7 @@ int SdScan(const char *path){
 
     printf("  Seek_Error=%d\n", Seek_Error);
     printf("  Reallocated_Sectors_Count=%d\n", Reallocated_Sectors_Count);
+    */
     printf("\n");
     close(fd);
 }
@@ -595,6 +669,129 @@ int NvmeScan(const char *path){
         if (i % 16 == 0) printf("\n    %03X: ", i);
         printf("%02X ", smart_log[i]);
     }
+    printf("\n");
+
+
+
+    unsigned short temperature = 0;
+    unsigned long long dur_low = 0;
+    unsigned long long dur_high = 0;
+    unsigned long long duw_low = 0;
+    unsigned long long duw_high = 0;
+    unsigned long long hrc_low = 0;
+    unsigned long long hrc_high = 0;
+    unsigned long long hwc_low = 0;
+    unsigned long long hwc_high = 0;
+    unsigned long long cbt_low = 0;
+    unsigned long long cbt_high = 0;
+    unsigned long long pwrc_low = 0;
+    unsigned long long pwrc_high = 0;
+    unsigned long long poh_low = 0;
+    unsigned long long poh_high = 0;
+    unsigned long long upl_low = 0;
+    unsigned long long upl_high = 0;
+    unsigned long long mdie_low = 0;
+    unsigned long long mdie_high = 0;
+    unsigned long long neile_low = 0;
+    unsigned long long neile_high = 0;
+    unsigned int wctt = 0;
+    unsigned int cctt = 0;
+    unsigned short tsen1 = 0;
+    unsigned short tsen2 = 0;
+    unsigned short tsen3 = 0;
+    unsigned short tsen4 = 0;
+    unsigned short tsen5 = 0;
+    unsigned short tsen6 = 0;
+    unsigned short tsen7 = 0;
+    unsigned short tsen8 = 0;
+    unsigned int tmt1tc = 0;
+    unsigned int tmt2tc = 0;
+    unsigned int tttmt1 = 0;
+    unsigned int tttmt2 = 0;
+    unsigned long long olec = 0;
+    unsigned int ipm = 0;
+    memcpy(&temperature, &smart_log[1], sizeof(unsigned short));
+    memcpy(&dur_low, &smart_log[32], sizeof(dur_low));
+    memcpy(&dur_high, &smart_log[40], sizeof(dur_high));
+    memcpy(&duw_low, &smart_log[48], sizeof(duw_low));
+    memcpy(&duw_high, &smart_log[56], sizeof(duw_high));
+    memcpy(&hrc_low, &smart_log[64], sizeof(hrc_low));
+    memcpy(&hrc_high, &smart_log[72], sizeof(hrc_high));
+    memcpy(&hwc_low, &smart_log[80], sizeof(hwc_low));
+    memcpy(&hwc_high, &smart_log[88], sizeof(hwc_high));
+    memcpy(&cbt_low, &smart_log[96], sizeof(cbt_low));
+    memcpy(&cbt_high, &smart_log[104], sizeof(cbt_high));
+    memcpy(&pwrc_low, &smart_log[112], sizeof(pwrc_low));
+    memcpy(&pwrc_high, &smart_log[120], sizeof(pwrc_high));
+    memcpy(&poh_low, &smart_log[128], sizeof(poh_low));
+    memcpy(&poh_high, &smart_log[136], sizeof(poh_high));
+    memcpy(&upl_low, &smart_log[144], sizeof(upl_low));
+    memcpy(&upl_high, &smart_log[152], sizeof(upl_high));
+    memcpy(&mdie_low, &smart_log[160], sizeof(mdie_low));
+    memcpy(&mdie_high, &smart_log[168], sizeof(mdie_high));
+    memcpy(&neile_low, &smart_log[176], sizeof(neile_low));
+    memcpy(&neile_high, &smart_log[184], sizeof(neile_high));
+    memcpy(&wctt, &smart_log[192], sizeof(wctt));
+    memcpy(&cctt, &smart_log[196], sizeof(cctt));
+    memcpy(&tsen1, &smart_log[200], sizeof(tsen1));
+    memcpy(&tsen2, &smart_log[202], sizeof(tsen2));
+    memcpy(&tsen3, &smart_log[204], sizeof(tsen3));
+    memcpy(&tsen4, &smart_log[206], sizeof(tsen4));
+    memcpy(&tsen5, &smart_log[208], sizeof(tsen5));
+    memcpy(&tsen6, &smart_log[210], sizeof(tsen6));
+    memcpy(&tsen7, &smart_log[212], sizeof(tsen7));
+    memcpy(&tsen8, &smart_log[214], sizeof(tsen8));
+    memcpy(&tmt1tc, &smart_log[216], sizeof(tmt1tc));
+    memcpy(&tmt2tc, &smart_log[220], sizeof(tmt2tc));
+    memcpy(&tttmt1, &smart_log[224], sizeof(tttmt1));
+    memcpy(&tttmt2, &smart_log[228], sizeof(tttmt2));
+    memcpy(&olec, &smart_log[232], sizeof(olec));
+    memcpy(&ipm, &smart_log[240], sizeof(ipm));
+
+    printf("  Composite Temperature=                            %hu\n", temperature);
+    printf("  Available Spare=                                  %hu\n", smart_log[3]);
+    printf("  Available Spare Threshold=                        %hu\n", smart_log[4]);
+    printf("  Percentage Used=                                  %hu\n", smart_log[5]);
+    printf("  Endurance Group Critical Warning Summary=         %hu\n", smart_log[6]);
+    printf("  Data Units Read(Low)=                             %llu\n", dur_low);
+    printf("  Data Units Read(Hight)=                           %llu\n", dur_high);
+    printf("  Data Units Written(Low)=                          %llu\n", duw_low);
+    printf("  Data Units Written(Hight)=                        %llu\n", duw_high);
+    printf("  Host Read Commands(Low)=                          %llu\n", hrc_low);
+    printf("  Host Read Commands(Hight)=                        %llu\n", hrc_high);
+    printf("  Host Write Commands(Low)=                         %llu\n", hwc_low);
+    printf("  Host Write Commands(Hight)=                       %llu\n", hwc_high);
+    printf("  Controller Busy Time(Low)=                        %llu\n", cbt_low);
+    printf("  Controller Busy Time(Hight)=                      %llu\n", cbt_high);
+    printf("  Power Cycles(Low)=                                %llu\n", pwrc_low);
+    printf("  Power Cycles(Hight)=                              %llu\n", pwrc_high);
+    printf("  Power On Hours(Low)=                              %llu\n", poh_low);
+    printf("  Power On Hours(Hight)=                            %llu\n", poh_high);
+    printf("  Unexpected Power Losses(Low)=                     %llu\n", upl_low);
+    printf("  Unexpected Power Losses(Hight)=                   %llu\n", upl_high);
+    printf("  Media and Data Integrity Errors(Low)=             %llu\n", mdie_low);
+    printf("  Media and Data Integrity Errors(Hight)=           %llu\n", mdie_high);
+    printf("  Number of Error Information Log Entries(Low)=     %llu\n", neile_low);
+    printf("  Number of Error Information Log Entries(Hight)=   %llu\n", neile_high);
+    printf("  Warning Composite Temperature Time=               %u\n", wctt);
+    printf("  Critical Composite Temperature Time=              %u\n", cctt);
+    printf("  Temperature Sensor 1=                             %hu\n", tsen1);
+    printf("  Temperature Sensor 2=                             %hu\n", tsen2);
+    printf("  Temperature Sensor 3=                             %hu\n", tsen3);
+    printf("  Temperature Sensor 4=                             %hu\n", tsen4);
+    printf("  Temperature Sensor 5=                             %hu\n", tsen5);
+    printf("  Temperature Sensor 6=                             %hu\n", tsen6);
+    printf("  Temperature Sensor 7=                             %hu\n", tsen7);
+    printf("  Temperature Sensor 8=                             %hu\n", tsen8);
+    printf("  Thermal Management Temperature 1 Transition Count=%u\n", tmt1tc);
+    printf("  Thermal Management Temperature 2 Transition Count=%u\n", tmt2tc);
+    printf("  Total Time For Thermal Management Temperature 1=  %u\n", tttmt1);
+    printf("  Total Time For Thermal Management Temperature 2=  %u\n", tttmt2);
+    printf("  Operational Lifetime Energy Consumed=             %llu\n", olec);
+    printf("  Interval Power Measurement=                       %u\n", ipm);
+
+
+
 
     printf("\n  SMART status: ");
     if ((smart_log[0] & 0xFF) != 0x0){
@@ -681,5 +878,8 @@ int main() {
 
     fclose(sata_dict);
     closedir(dir);
+    
+    printf("Press Enter to exit...");
+    getchar();
     return 0;
 }

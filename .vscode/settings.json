@@ -4,6 +4,7 @@
         "ntddstor.h": "c",
         "ntddscsi.h": "c",
         "setupapi.h": "c",
-        "stdint.h": "c"
+        "stdint.h": "c",
+        "winioctl.h": "c"
     }
 }

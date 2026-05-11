@@ -9,8 +9,11 @@
 #include <assert.h>
 #include <nvme.h>
 
+#include "crossplatform.h"
+
 //minimum Windows version: Windows 10 (IOCTL_STORAGE_PROTOCOL_COMMAND requironment)
 
+//TODO: Проверить правильность чтения thresholds
 //TODO: Перепроверить вызов IOCTL_ATA_PASS_THROUGH для получения статуса SMART для SATA
 //TODO: Попробовать переписать для SATA вызов Smart Read Data с использованием IOCTL_ATA_PASS_THROUGH
 //TODO: IOCTL_STORAGE_QUERY_PROPERTY - посмотреть все варианты возвращаемых байтов при успешном и неуспешном запросе и переписать структуры, которые принимают эти байты.
@@ -25,7 +28,6 @@
 #define SMART_RETURN_STATUS_FEATURE 0xDA
 #define SMART_CYL_LOW 0x4F
 #define SMART_CYL_HIGH 0xC2
-#define SMART_DATA_SIZE_BYTES 512
 #define SMART_DATA_SIZE_DWORDS 128
 #define SMART_LID 0x02
 
@@ -380,32 +382,71 @@ int SataScan(HANDLE handle, const char *model){
     if (checksum != 0 || only_zeros || only_ffs){
         fprintf(stderr, "Warning: Invalid checksum or other parameters of SMART table. Result will be incorrect.\n");
     }
+    
+    SmartData smartData = {0};
+    loadSataSMARTAttributes(&smartData, sptwb.DataBuf);
 
-    char* profile_name = FindGroupByModel(model);
-    int Seek_Error = -1;
-    int Reallocated_Sectors_Count = -1;
-    if (profile_name != NULL){
-        Seek_Error = FindSmartByte(profile_name, "Seek_Error");
-        if (Seek_Error < 0){
-            fprintf(stderr, "Warning: 'FindSmartByte()' function cant return correct value for 'Seek_Error'. Using default profile. Result may be incorrect.\n");
-            Seek_Error = FindDefaultSmartByte("Seek_Error");
+
+
+    returned = 0;
+    memset(&sptwb, 0, sizeof(sptwb));
+
+    spt->Length = sizeof(SCSI_PASS_THROUGH);
+    spt->CdbLength = 16;
+    spt->DataIn = SCSI_IOCTL_DATA_IN;
+    spt->DataTransferLength = sizeof(sptwb.DataBuf);
+    spt->TimeOutValue = 10;
+    spt->DataBufferOffset = offsetof(SCSI_PASS_THROUGH_WITH_BUFFERS, DataBuf);
+    spt->SenseInfoOffset = offsetof(SCSI_PASS_THROUGH_WITH_BUFFERS, SenseBuf);
+    spt->SenseInfoLength = sizeof(sptwb.SenseBuf);
+
+    cdb[0] = SG_ATA_16;
+    cdb[1] = (0x4 << 1);
+    cdb[2] = (1 << 3) | (0x2 << 2) | 1;
+    cdb[4] = SMART_READ_THRESHOLDS;
+    cdb[6] = 0x01;
+    cdb[10] = SMART_CYL_LOW;
+    cdb[12] = SMART_CYL_HIGH;
+    cdb[14] = ATA_SMART_CMD;
+
+    if (!DeviceIoControl(handle, IOCTL_SCSI_PASS_THROUGH, &sptwb, sizeof(sptwb), &sptwb, sizeof(sptwb), &returned, NULL)) {
+        fprintf(stderr, "[DeviceIoControl] IOCTL_SCSI_PASS_THROUGH failed. Errcode: %lu\n", GetLastError());
+        return -1;
+    }
+
+    if (spt->ScsiStatus != 0) {
+        fprintf(stderr, "SCSI command error: status=%x, response code=%x\n", spt->ScsiStatus, (sptwb.SenseBuf[0] & 0x7F));
+        if ((sptwb.SenseBuf[0] & 0x7F) == 0x70 || (sptwb.SenseBuf[0] & 0x7F) == 0x71){
+            printf("sense key=%x\n", (sptwb.SenseBuf[1] & 0xF));
+            printf("additional sense code=%x\n", sptwb.SenseBuf[12]);
+            printf("additional sense code qualifier=%x\n", sptwb.SenseBuf[13]);
+            printf("For more information see official specification\n\n");
+        } else if ((sptwb.SenseBuf[0] & 0x7F) == 0x72 || (sptwb.SenseBuf[0] & 0x7F) == 0x73){
+            printf("sense key=%x\n", (sptwb.SenseBuf[1] & 0xF));
+            printf("additional sense code=%x\n", sptwb.SenseBuf[2]);
+            printf("additional sense code qualifier=%x\n", sptwb.SenseBuf[3]);
+            printf("For more information see official specification\n\n");
+        } else{
+            printf("returned unknown response code.\n\n");
         }
-        if (Seek_Error < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Seek_Error'. Result will be incorrect.\n");
+        return -1;
+    }
 
-        Reallocated_Sectors_Count = FindSmartByte(profile_name, "Reallocated_Sectors_Count");
-        if (Reallocated_Sectors_Count < 0){
-            fprintf(stderr, "Warning: 'FindSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Using default profile. Result may be incorrect.\n");
-            Reallocated_Sectors_Count = FindDefaultSmartByte("Reallocated_Sectors_Count");
+    loadSataSMARTThresholds(&smartData, sptwb.DataBuf);
+
+    for (size_t i = 0; i < SATA_SMART_ATTRIBUTES_COUNT; i++){
+        SataSMARTAttribute currentAttribute = smartData.attributes[i].attribute;
+        SataSMARTThreshold currentThreshold = smartData.attributes[i].threshold;
+        if (currentAttribute.id == 0){
+            if (currentThreshold.id != 0){
+                printf("WARNING: unexisted attribute has threshold id=%hu\n", currentThreshold.id);
+            }
+            continue;
         }
-        if (Reallocated_Sectors_Count  < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Result will be incorrect.\n");
-    } else {
-        fprintf(stderr, "Warning: didnt find profile for '%s' in 'sata_dict.ini'. Result may be incorrect.\n", model);
+        printf("  attribute id(%hu):\timportant=%s\tvalue=%hu,\tworst=%hu\t", currentAttribute.id, (currentAttribute.flags[0] & 1) ? "true" : "false", currentAttribute.normalized, currentAttribute.worst);
+        if (currentThreshold.id == 0) printf("threshold=undefined\n");
+        else printf("threshold=%hu\n", currentThreshold.threshold);
 
-        Seek_Error = FindDefaultSmartByte("Seek_Error");
-        if (Seek_Error < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Seek_Error'. Result will be incorrect.\n");
-
-        Reallocated_Sectors_Count = FindDefaultSmartByte("Reallocated_Sectors_Count");
-        if (Reallocated_Sectors_Count  < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Result will be incorrect.\n");
     }
 
 
@@ -443,12 +484,40 @@ int SataScan(HANDLE handle, const char *model){
     else if (cyl_lo == 0x4F && cyl_hi == 0xC2) printf("    SMART status: ok\n"); // OK
     else if (cyl_lo == 0xF4 && cyl_hi == 0x2C) printf("    SMART status: not ok\n"); // FAIL
     else  fprintf(stderr, "[DeviceIoControl] IOCTL_ATA_PASS_THROUGH warning. Undefined status: cyl_low = 0x%X, cyl_hi = 0x%X\n", cyl_lo, cyl_hi);
-    
 
 
+
+    /*
+    char* profile_name = FindGroupByModel(model);
+    int Seek_Error = -1;
+    int Reallocated_Sectors_Count = -1;
+    if (profile_name != NULL){
+        Seek_Error = FindSmartByte(profile_name, "Seek_Error");
+        if (Seek_Error < 0){
+            fprintf(stderr, "Warning: 'FindSmartByte()' function cant return correct value for 'Seek_Error'. Using default profile. Result may be incorrect.\n");
+            Seek_Error = FindDefaultSmartByte("Seek_Error");
+        }
+        if (Seek_Error < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Seek_Error'. Result will be incorrect.\n");
+
+        Reallocated_Sectors_Count = FindSmartByte(profile_name, "Reallocated_Sectors_Count");
+        if (Reallocated_Sectors_Count < 0){
+            fprintf(stderr, "Warning: 'FindSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Using default profile. Result may be incorrect.\n");
+            Reallocated_Sectors_Count = FindDefaultSmartByte("Reallocated_Sectors_Count");
+        }
+        if (Reallocated_Sectors_Count  < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Result will be incorrect.\n");
+    } else {
+        fprintf(stderr, "Warning: didnt find profile for '%s' in 'sata_dict.ini'. Result may be incorrect.\n", model);
+
+        Seek_Error = FindDefaultSmartByte("Seek_Error");
+        if (Seek_Error < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Seek_Error'. Result will be incorrect.\n");
+
+        Reallocated_Sectors_Count = FindDefaultSmartByte("Reallocated_Sectors_Count");
+        if (Reallocated_Sectors_Count  < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Result will be incorrect.\n");
+    }
 
     printf("  Seek_Error=%d\n", Seek_Error);
     printf("  Reallocated_Sectors_Count=%d\n", Reallocated_Sectors_Count);
+    */
     printf("\n");
     
 }
@@ -529,6 +598,106 @@ int NvmeScan(HANDLE handle, const char *model){
         if (i % 16 == 0) printf("\n    %03X: ", i);
         printf("%02X ", ((UCHAR*)smartInfo)[i]);
     }
+    printf("\n");
+
+    UINT16 temperature = 0;
+    UCHAR egcws = smartInfo->Reserved0[0];
+    ULONG64 dur_low = 0;
+    ULONG64 dur_high = 0;
+    ULONG64 duw_low = 0;
+    ULONG64 duw_high = 0;
+    ULONG64 hrc_low = 0;
+    ULONG64 hrc_high = 0;
+    ULONG64 hwc_low = 0;
+    ULONG64 hwc_high = 0;
+    ULONG64 cbt_low = 0;
+    ULONG64 cbt_high = 0;
+    ULONG64 pwrc_low = 0;
+    ULONG64 pwrc_high = 0;
+    ULONG64 poh_low = 0;
+    ULONG64 poh_high = 0;
+    ULONG64 upl_low = 0;
+    ULONG64 upl_high = 0;
+    ULONG64 mdie_low = 0;
+    ULONG64 mdie_high = 0;
+    ULONG64 neile_low = 0;
+    ULONG64 neile_high = 0;
+    UINT32 tmt1tc = 0;
+    UINT32 tmt2tc = 0;
+    UINT32 tttmt1 = 0;
+    UINT32 tttmt2 = 0;
+    ULONG64 olec = 0;
+    UINT32 ipm = 0;
+    memcpy(&temperature, smartInfo->Temperature, sizeof(UINT16));
+    memcpy(&dur_low, smartInfo->DataUnitRead, sizeof(ULONG64));
+    memcpy(&dur_high, &smartInfo->DataUnitRead[8], sizeof(ULONG64));
+    memcpy(&duw_low, smartInfo->DataUnitWritten, sizeof(ULONG64));
+    memcpy(&duw_high, &smartInfo->DataUnitWritten[8], sizeof(ULONG64));
+    memcpy(&hrc_low, smartInfo->HostReadCommands, sizeof(ULONG64));
+    memcpy(&hrc_high, &smartInfo->HostReadCommands[8], sizeof(ULONG64));
+    memcpy(&hwc_low, smartInfo->HostWrittenCommands, sizeof(ULONG64));
+    memcpy(&hwc_high, &smartInfo->HostWrittenCommands[8], sizeof(ULONG64));
+    memcpy(&cbt_low, smartInfo->ControllerBusyTime, sizeof(ULONG64));
+    memcpy(&cbt_high, &smartInfo->ControllerBusyTime[8], sizeof(ULONG64));
+    memcpy(&pwrc_low, smartInfo->PowerCycle, sizeof(ULONG64));
+    memcpy(&pwrc_high, &smartInfo->PowerCycle[8], sizeof(ULONG64));
+    memcpy(&poh_low, smartInfo->PowerOnHours, sizeof(ULONG64));
+    memcpy(&poh_high, &smartInfo->PowerOnHours[8], sizeof(ULONG64));
+    memcpy(&upl_low, smartInfo->UnsafeShutdowns, sizeof(ULONG64));
+    memcpy(&upl_high, &smartInfo->UnsafeShutdowns[8], sizeof(ULONG64));
+    memcpy(&mdie_low, smartInfo->MediaErrors, sizeof(ULONG64));
+    memcpy(&mdie_high, &smartInfo->MediaErrors[8], sizeof(ULONG64));
+    memcpy(&neile_low, smartInfo->ErrorInfoLogEntryCount, sizeof(ULONG64));
+    memcpy(&neile_high, &smartInfo->ErrorInfoLogEntryCount[8], sizeof(ULONG64));
+    memcpy(&tmt1tc, smartInfo->Reserved1, sizeof(UINT32));
+    memcpy(&tmt2tc, &smartInfo->Reserved1[4], sizeof(UINT32));
+    memcpy(&tttmt1, &smartInfo->Reserved1[8], sizeof(UINT32));
+    memcpy(&tttmt2, &smartInfo->Reserved1[12], sizeof(UINT32));
+    memcpy(&olec, &smartInfo->Reserved1[16], sizeof(ULONG64));
+    memcpy(&ipm, &smartInfo->Reserved1[24], sizeof(UINT32));
+
+    printf("  Composite Temperature=                            %hu\n", temperature);
+    printf("  Available Spare=                                  %hu\n", smartInfo->AvailableSpare);
+    printf("  Available Spare Threshold=                        %hu\n", smartInfo->AvailableSpareThreshold);
+    printf("  Percentage Used=                                  %hu\n", smartInfo->PercentageUsed);
+    printf("  Endurance Group Critical Warning Summary=         %hu\n", smartInfo->Reserved0[0]);
+    printf("  Data Units Read(Low)=                             %llu\n", dur_low);
+    printf("  Data Units Read(Hight)=                           %llu\n", dur_high);
+    printf("  Data Units Written(Low)=                          %llu\n", duw_low);
+    printf("  Data Units Written(Hight)=                        %llu\n", duw_high);
+    printf("  Host Read Commands(Low)=                          %llu\n", hrc_low);
+    printf("  Host Read Commands(Hight)=                        %llu\n", hrc_high);
+    printf("  Host Write Commands(Low)=                         %llu\n", hwc_low);
+    printf("  Host Write Commands(Hight)=                       %llu\n", hwc_high);
+    printf("  Controller Busy Time(Low)=                        %llu\n", cbt_low);
+    printf("  Controller Busy Time(Hight)=                      %llu\n", cbt_high);
+    printf("  Power Cycles(Low)=                                %llu\n", pwrc_low);
+    printf("  Power Cycles(Hight)=                              %llu\n", pwrc_high);
+    printf("  Power On Hours(Low)=                              %llu\n", poh_low);
+    printf("  Power On Hours(Hight)=                            %llu\n", poh_high);
+    printf("  Unexpected Power Losses(Low)=                     %llu\n", upl_low);
+    printf("  Unexpected Power Losses(Hight)=                   %llu\n", upl_high);
+    printf("  Media and Data Integrity Errors(Low)=             %llu\n", mdie_low);
+    printf("  Media and Data Integrity Errors(Hight)=           %llu\n", mdie_high);
+    printf("  Number of Error Information Log Entries(Low)=     %llu\n", neile_low);
+    printf("  Number of Error Information Log Entries(Hight)=   %llu\n", neile_high);
+    printf("  Warning Composite Temperature Time=               %u\n", smartInfo->WarningCompositeTemperatureTime);
+    printf("  Critical Composite Temperature Time=              %u\n", smartInfo->CriticalCompositeTemperatureTime);
+    printf("  Temperature Sensor 1=                             %hu\n", smartInfo->TemperatureSensor1);
+    printf("  Temperature Sensor 2=                             %hu\n", smartInfo->TemperatureSensor2);
+    printf("  Temperature Sensor 3=                             %hu\n", smartInfo->TemperatureSensor3);
+    printf("  Temperature Sensor 4=                             %hu\n", smartInfo->TemperatureSensor4);
+    printf("  Temperature Sensor 5=                             %hu\n", smartInfo->TemperatureSensor5);
+    printf("  Temperature Sensor 6=                             %hu\n", smartInfo->TemperatureSensor6);
+    printf("  Temperature Sensor 7=                             %hu\n", smartInfo->TemperatureSensor7);
+    printf("  Temperature Sensor 8=                             %hu\n", smartInfo->TemperatureSensor8);
+    printf("  Thermal Management Temperature 1 Transition Count=%u\n", tmt1tc);
+    printf("  Thermal Management Temperature 2 Transition Count=%u\n", tmt2tc);
+    printf("  Total Time For Thermal Management Temperature 1=  %u\n", tttmt1);
+    printf("  Total Time For Thermal Management Temperature 2=  %u\n", tttmt2);
+    printf("  Operational Lifetime Energy Consumed=             %llu\n", olec);
+    printf("  Interval Power Measurement=                       %u\n", ipm);
+
 
     printf("\n  SMART status: ");
     if ((((UCHAR*)smartInfo)[0] & 0xFF) != 0x0){
