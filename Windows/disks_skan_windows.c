@@ -191,21 +191,6 @@ char *FindGroupByModel(const char *model) {
     return NULL;
 }
 
-//Эта функция возвращает поле 'name' структуры 'Group', которая содержит указанную модель диска '*model'
-//В данном варианте реализован поиск модели по точному совпадению
-/*
-char *FindGroupByModel(const char *model) {
-    for (int i = 0; i < model_group_count; i++) {
-        for (int j = 0; j < model_groups[i].model_count; j++) {
-            if (strcmp(model_groups[i].models[j], model) == 0) {
-                return model_groups[i].name;
-            }
-        }
-    }
-    return NULL;
-}
-*/
-
 
 int FindSmartByte (const char* profile_name, const char* attribute_name){
     if (sata_dict == NULL){
@@ -366,6 +351,7 @@ int SataScan(HANDLE handle, const char *model){
         return -1;
     }
 
+    /*--------------------------------------------------------------------Печать таблицы SMART
     printf("  SMART data:");
     unsigned char checksum = 0;
     bool only_zeros = true;
@@ -382,6 +368,8 @@ int SataScan(HANDLE handle, const char *model){
     if (checksum != 0 || only_zeros || only_ffs){
         fprintf(stderr, "Warning: Invalid checksum or other parameters of SMART table. Result will be incorrect.\n");
     }
+    */
+   printf("\n");
     
     SmartData smartData = {0};
     loadSataSMARTAttributes(&smartData, sptwb.DataBuf);
@@ -480,46 +468,44 @@ int SataScan(HANDLE handle, const char *model){
     BYTE cyl_hi = pt->CurrentTaskFile[4];
     bool error_bit = pt->CurrentTaskFile[6] & 1;
 
+    
+
+    bool returned_status_warning = false;
     if (error_bit)  fprintf(stderr, "[DeviceIoControl] IOCTL_ATA_PASS_THROUGH warning. Error bit = 1\n");
-    else if (cyl_lo == 0x4F && cyl_hi == 0xC2) printf("    SMART status: ok\n"); // OK
-    else if (cyl_lo == 0xF4 && cyl_hi == 0x2C) printf("    SMART status: not ok\n"); // FAIL
+    else if (cyl_lo == 0x4F && cyl_hi == 0xC2) returned_status_warning = false; // OK
+    else if (cyl_lo == 0xF4 && cyl_hi == 0x2C) returned_status_warning = true; // FAIL
     else  fprintf(stderr, "[DeviceIoControl] IOCTL_ATA_PASS_THROUGH warning. Undefined status: cyl_low = 0x%X, cyl_hi = 0x%X\n", cyl_lo, cyl_hi);
 
+    bool thresholds_warning = false;
+    printf("\n  SMART status: ");
 
+    for (size_t i = 0; i < SATA_SMART_ATTRIBUTES_COUNT; i++){
+        if (smartData.attributes[i].attribute.id == 0) continue;
+        bool important = smartData.attributes[i].attribute.flags[0] & 1;
+        unsigned char id = smartData.attributes[i].attribute.id;
+        unsigned char value = smartData.attributes[i].attribute.normalized;
+        unsigned char threshold = smartData.attributes[i].threshold.threshold;
 
-    /*
-    char* profile_name = FindGroupByModel(model);
-    int Seek_Error = -1;
-    int Reallocated_Sectors_Count = -1;
-    if (profile_name != NULL){
-        Seek_Error = FindSmartByte(profile_name, "Seek_Error");
-        if (Seek_Error < 0){
-            fprintf(stderr, "Warning: 'FindSmartByte()' function cant return correct value for 'Seek_Error'. Using default profile. Result may be incorrect.\n");
-            Seek_Error = FindDefaultSmartByte("Seek_Error");
+        if (important && (value < threshold)){
+            if(!thresholds_warning) {
+                thresholds_warning = true;
+                printf("not ok. Reasons:\n");
+            }
+
+            printf("    attribute (%hu) below threshold:\n", id);
+            printf("      value=     %hu\n", value);
+            printf("      threshold= %hu\n", threshold);
         }
-        if (Seek_Error < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Seek_Error'. Result will be incorrect.\n");
-
-        Reallocated_Sectors_Count = FindSmartByte(profile_name, "Reallocated_Sectors_Count");
-        if (Reallocated_Sectors_Count < 0){
-            fprintf(stderr, "Warning: 'FindSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Using default profile. Result may be incorrect.\n");
-            Reallocated_Sectors_Count = FindDefaultSmartByte("Reallocated_Sectors_Count");
-        }
-        if (Reallocated_Sectors_Count  < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Result will be incorrect.\n");
-    } else {
-        fprintf(stderr, "Warning: didnt find profile for '%s' in 'sata_dict.ini'. Result may be incorrect.\n", model);
-
-        Seek_Error = FindDefaultSmartByte("Seek_Error");
-        if (Seek_Error < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Seek_Error'. Result will be incorrect.\n");
-
-        Reallocated_Sectors_Count = FindDefaultSmartByte("Reallocated_Sectors_Count");
-        if (Reallocated_Sectors_Count  < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Result will be incorrect.\n");
     }
 
-    printf("  Seek_Error=%d\n", Seek_Error);
-    printf("  Reallocated_Sectors_Count=%d\n", Reallocated_Sectors_Count);
-    */
+    if (returned_status_warning){
+        if (!thresholds_warning) printf("not ok. Reasons:\n");
+        printf("    \'SMART RETURN STATUS\' command returned error status\n");
+    } else if (!thresholds_warning){
+        printf("ok.\n");
+    }
+
     printf("\n");
-    
 }
 
 //Эта функция посылает команды NVMe устройству для получения информации о нём и его SMART параметрах и выводит эту информацию.
@@ -592,14 +578,18 @@ int NvmeScan(HANDLE handle, const char *model){
     }
 
     PNVME_HEALTH_INFO_LOG smartInfo = (PNVME_HEALTH_INFO_LOG)((PCHAR)protocolData + protocolData->ProtocolDataOffset);
-
+    
+    /*--------------------------------------------------------------------Печать таблицы SMART
     printf("  SMART data:");
     for (int i = 0; i < SMART_DATA_SIZE_BYTES; i++) {
         if (i % 16 == 0) printf("\n    %03X: ", i);
         printf("%02X ", ((UCHAR*)smartInfo)[i]);
     }
+    */
+
     printf("\n");
 
+    UCHAR cw = 0;
     UINT16 temperature = 0;
     UCHAR egcws = smartInfo->Reserved0[0];
     ULONG64 dur_low = 0;
@@ -628,39 +618,41 @@ int NvmeScan(HANDLE handle, const char *model){
     UINT32 tttmt2 = 0;
     ULONG64 olec = 0;
     UINT32 ipm = 0;
-    memcpy(&temperature, smartInfo->Temperature, sizeof(UINT16));
-    memcpy(&dur_low, smartInfo->DataUnitRead, sizeof(ULONG64));
-    memcpy(&dur_high, &smartInfo->DataUnitRead[8], sizeof(ULONG64));
-    memcpy(&duw_low, smartInfo->DataUnitWritten, sizeof(ULONG64));
-    memcpy(&duw_high, &smartInfo->DataUnitWritten[8], sizeof(ULONG64));
-    memcpy(&hrc_low, smartInfo->HostReadCommands, sizeof(ULONG64));
-    memcpy(&hrc_high, &smartInfo->HostReadCommands[8], sizeof(ULONG64));
-    memcpy(&hwc_low, smartInfo->HostWrittenCommands, sizeof(ULONG64));
-    memcpy(&hwc_high, &smartInfo->HostWrittenCommands[8], sizeof(ULONG64));
-    memcpy(&cbt_low, smartInfo->ControllerBusyTime, sizeof(ULONG64));
-    memcpy(&cbt_high, &smartInfo->ControllerBusyTime[8], sizeof(ULONG64));
-    memcpy(&pwrc_low, smartInfo->PowerCycle, sizeof(ULONG64));
-    memcpy(&pwrc_high, &smartInfo->PowerCycle[8], sizeof(ULONG64));
-    memcpy(&poh_low, smartInfo->PowerOnHours, sizeof(ULONG64));
-    memcpy(&poh_high, &smartInfo->PowerOnHours[8], sizeof(ULONG64));
-    memcpy(&upl_low, smartInfo->UnsafeShutdowns, sizeof(ULONG64));
-    memcpy(&upl_high, &smartInfo->UnsafeShutdowns[8], sizeof(ULONG64));
-    memcpy(&mdie_low, smartInfo->MediaErrors, sizeof(ULONG64));
-    memcpy(&mdie_high, &smartInfo->MediaErrors[8], sizeof(ULONG64));
-    memcpy(&neile_low, smartInfo->ErrorInfoLogEntryCount, sizeof(ULONG64));
-    memcpy(&neile_high, &smartInfo->ErrorInfoLogEntryCount[8], sizeof(ULONG64));
-    memcpy(&tmt1tc, smartInfo->Reserved1, sizeof(UINT32));
-    memcpy(&tmt2tc, &smartInfo->Reserved1[4], sizeof(UINT32));
-    memcpy(&tttmt1, &smartInfo->Reserved1[8], sizeof(UINT32));
-    memcpy(&tttmt2, &smartInfo->Reserved1[12], sizeof(UINT32));
-    memcpy(&olec, &smartInfo->Reserved1[16], sizeof(ULONG64));
-    memcpy(&ipm, &smartInfo->Reserved1[24], sizeof(UINT32));
+    memcpy(&cw, &smartInfo->CriticalWarning, sizeof(cw));
+    memcpy(&temperature, smartInfo->Temperature, sizeof(temperature));
+    memcpy(&dur_low, smartInfo->DataUnitRead, sizeof(dur_low));
+    memcpy(&dur_high, &smartInfo->DataUnitRead[8], sizeof(dur_high));
+    memcpy(&duw_low, smartInfo->DataUnitWritten, sizeof(duw_low));
+    memcpy(&duw_high, &smartInfo->DataUnitWritten[8], sizeof(duw_high));
+    memcpy(&hrc_low, smartInfo->HostReadCommands, sizeof(hrc_low));
+    memcpy(&hrc_high, &smartInfo->HostReadCommands[8], sizeof(hrc_high));
+    memcpy(&hwc_low, smartInfo->HostWrittenCommands, sizeof(hwc_low));
+    memcpy(&hwc_high, &smartInfo->HostWrittenCommands[8], sizeof(hwc_high));
+    memcpy(&cbt_low, smartInfo->ControllerBusyTime, sizeof(cbt_low));
+    memcpy(&cbt_high, &smartInfo->ControllerBusyTime[8], sizeof(cbt_high));
+    memcpy(&pwrc_low, smartInfo->PowerCycle, sizeof(pwrc_low));
+    memcpy(&pwrc_high, &smartInfo->PowerCycle[8], sizeof(pwrc_high));
+    memcpy(&poh_low, smartInfo->PowerOnHours, sizeof(poh_low));
+    memcpy(&poh_high, &smartInfo->PowerOnHours[8], sizeof(poh_high));
+    memcpy(&upl_low, smartInfo->UnsafeShutdowns, sizeof(upl_low));
+    memcpy(&upl_high, &smartInfo->UnsafeShutdowns[8], sizeof(upl_high));
+    memcpy(&mdie_low, smartInfo->MediaErrors, sizeof(mdie_low));
+    memcpy(&mdie_high, &smartInfo->MediaErrors[8], sizeof(mdie_high));
+    memcpy(&neile_low, smartInfo->ErrorInfoLogEntryCount, sizeof(neile_low));
+    memcpy(&neile_high, &smartInfo->ErrorInfoLogEntryCount[8], sizeof(neile_high));
+    memcpy(&tmt1tc, smartInfo->Reserved1, sizeof(tmt1tc));
+    memcpy(&tmt2tc, &smartInfo->Reserved1[4], sizeof(tmt2tc));
+    memcpy(&tttmt1, &smartInfo->Reserved1[8], sizeof(tttmt1));
+    memcpy(&tttmt2, &smartInfo->Reserved1[12], sizeof(tttmt2));
+    memcpy(&olec, &smartInfo->Reserved1[16], sizeof(olec));
+    memcpy(&ipm, &smartInfo->Reserved1[24], sizeof(ipm));
 
+    printf("  Critical Warning=                                 %hu\n", cw);
     printf("  Composite Temperature=                            %hu\n", temperature);
     printf("  Available Spare=                                  %hu\n", smartInfo->AvailableSpare);
     printf("  Available Spare Threshold=                        %hu\n", smartInfo->AvailableSpareThreshold);
     printf("  Percentage Used=                                  %hu\n", smartInfo->PercentageUsed);
-    printf("  Endurance Group Critical Warning Summary=         %hu\n", smartInfo->Reserved0[0]);
+    printf("  Endurance Group Critical Warning Summary=         %hu\n", egcws);
     printf("  Data Units Read(Low)=                             %llu\n", dur_low);
     printf("  Data Units Read(Hight)=                           %llu\n", dur_high);
     printf("  Data Units Written(Low)=                          %llu\n", duw_low);
@@ -699,11 +691,21 @@ int NvmeScan(HANDLE handle, const char *model){
     printf("  Interval Power Measurement=                       %u\n", ipm);
 
 
+    bool cw_warning = (cw != 0);
+    bool egcws_warning = (egcws != 0);
+    bool as_warning = (smartInfo->AvailableSpare < smartInfo->AvailableSpareThreshold);
+
     printf("\n  SMART status: ");
-    if ((((UCHAR*)smartInfo)[0] & 0xFF) != 0x0){
-        printf("not ok.\n");
-        printf("    Critical Warning byte=0x%X. Problems:\n", ((UCHAR*)smartInfo)[0]);
-        
+
+    if (!cw_warning && !egcws_warning && !as_warning){
+        printf("ok.\n");
+    } else {
+        printf("not ok. Reasons:\n");
+    }
+
+    if (cw_warning){
+        printf("    Critical Warning byte=0x%X. Problems:\n", cw);
+
         if(smartInfo->CriticalWarning.AvailableSpaceLow){
             printf("      Available Spare Capacity Below Threshold (ASCBT)\n");
         }
@@ -725,9 +727,28 @@ int NvmeScan(HANDLE handle, const char *model){
         if((smartInfo->CriticalWarning.AsUchar & (0x1 << 6))){
             printf("      Indeterminate Personality State (IPS)\n");
         }
-    } else {
-        printf("ok.\n");
     }
+
+    if(egcws_warning){
+        printf("    Endurance Group Critical Warning Summary=0x%X. Problems:\n", egcws);
+
+        if(egcws & (0x1 << 0)){
+            printf("      Endurance Group Available Spare Capacity Below Threshold (EGASCBT)\n");
+        }
+        if(egcws & (0x1 << 2)){
+            printf("      Endurance Group Degraded Reliability (EGDR)\n");
+        }
+        if(egcws & (0x1 << 3)){
+            printf("      Endurance Group Read-Only (EGRO)\n");
+        }
+    }
+
+    if (as_warning){
+        printf("    Available Spare below threshold:\n");
+        printf("      Available Spare=           %hu\n", smartInfo->AvailableSpare);
+        printf("      Available Spare Threshold= %hu\n", smartInfo->AvailableSpareThreshold);
+    }
+
 
     printf("\n");
     free(buffer);

@@ -205,21 +205,6 @@ char *FindGroupByModel(const char *model) {
     return NULL;
 }
 
-//Эта функция возвращает поле 'name' структуры 'Group', которая содержит указанную модель диска '*model'
-//В данном варианте реализован поиск модели по точному совпадению
-/*
-char *FindGroupByModel(const char *model) {
-    for (int i = 0; i < model_group_count; i++) {
-        for (int j = 0; j < model_groups[i].model_count; j++) {
-            if (strcmp(model_groups[i].models[j], model) == 0) {
-                return model_groups[i].name;
-            }
-        }
-    }
-    return NULL;
-}
-*/
-
 
 int FindSmartByte (const char* profile_name, const char* attribute_name){
     if (sata_dict == NULL){
@@ -390,6 +375,7 @@ int SdScan(const char *path){
         return -1;
     }
 
+    /*--------------------------------------------------------------------Печать таблицы SMART
     printf("  SMART data:");
     unsigned char checksum = 0;
     bool only_zeros = true;
@@ -406,6 +392,8 @@ int SdScan(const char *path){
     if (checksum != 0 || only_zeros || only_ffs){
         fprintf(stderr, "Warning: Invalid checksum or other parameters of SMART table. Result will be incorrect.\n");
     }
+    */
+    printf("\n");
 
     SmartData smartData = {0};
     loadSataSMARTAttributes(&smartData, data);
@@ -553,9 +541,9 @@ int SdScan(const char *path){
             asc, ascq);
     }
 
+    bool returned_status_warning = false;
     bool error_bit;
     if (success){
-        printf("\n");
         for (int i = 8; i < io_hdr.sb_len_wr - 1; ) {
             unsigned char desc = sense[i];
             unsigned char desc_len  = sense[i+1];
@@ -565,48 +553,44 @@ int SdScan(const char *path){
                 error_bit = sense[i + 13] & 1;
 
                 if (error_bit) fprintf(stderr, "ioctl [SG_IO] warning. error bit = 1\n");
-                else if (cyl_lo == 0x4F && cyl_hi == 0xC2) printf("  SMART status: ok.\n"); // OK
-                else if (cyl_lo == 0xF4 && cyl_hi == 0x2C) printf("  SMART status: not ok.\n"); // FAIL
+                else if (cyl_lo == 0x4F && cyl_hi == 0xC2) returned_status_warning = false; // OK
+                else if (cyl_lo == 0xF4 && cyl_hi == 0x2C) returned_status_warning = true; // FAIL
                 else  fprintf(stderr, "ioctl [SG_IO] warning. Undefined status: cyl_low = 0x%X, cyl_hi = 0x%X\n", cyl_lo, cyl_hi);
                 break;
             }
             i += desc_len  + 2;
         }
-
-        
     }
 
-    /*
-    char* profile_name = FindGroupByModel(id.model);
-    int Seek_Error = -1;
-    int Reallocated_Sectors_Count = -1;
-    if (profile_name != NULL){
-        Seek_Error = FindSmartByte(profile_name, "Seek_Error");
-        if (Seek_Error < 0){
-            fprintf(stderr, "Warning: 'FindSmartByte()' function cant return correct value for 'Seek_Error'. Using default profile. Result may be incorrect.\n");
-            Seek_Error = FindDefaultSmartByte("Seek_Error");
+    bool thresholds_warning = false;
+    printf("\n  SMART status: ");
+
+    for (size_t i = 0; i < SATA_SMART_ATTRIBUTES_COUNT; i++){
+        if (smartData.attributes[i].attribute.id == 0) continue;
+        bool important = smartData.attributes[i].attribute.flags[0] & 1;
+        unsigned char id = smartData.attributes[i].attribute.id;
+        unsigned char value = smartData.attributes[i].attribute.normalized;
+        unsigned char threshold = smartData.attributes[i].threshold.threshold;
+
+        if (important && (value < threshold)){
+            if(!thresholds_warning) {
+                thresholds_warning = true;
+                printf("not ok. Reasons:\n");
+            }
+
+            printf("    attribute (%hu) below threshold:\n", id);
+            printf("      value=     %hu\n", value);
+            printf("      threshold= %hu\n", threshold);
         }
-        if (Seek_Error < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Seek_Error'. Result will be incorrect.\n");
-
-        Reallocated_Sectors_Count = FindSmartByte(profile_name, "Reallocated_Sectors_Count");
-        if (Reallocated_Sectors_Count < 0){
-            fprintf(stderr, "Warning: 'FindSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Using default profile. Result may be incorrect.\n");
-            Reallocated_Sectors_Count = FindDefaultSmartByte("Reallocated_Sectors_Count");
-        }
-        if (Reallocated_Sectors_Count  < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Result will be incorrect.\n");
-    } else {
-        fprintf(stderr, "Warning: didnt find profile for '%s' in 'sata_dict.ini'. Result may be incorrect.\n", id.model);
-
-        Seek_Error = FindDefaultSmartByte("Seek_Error");
-        if (Seek_Error < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Seek_Error'. Result will be incorrect.\n");
-
-        Reallocated_Sectors_Count = FindDefaultSmartByte("Reallocated_Sectors_Count");
-        if (Reallocated_Sectors_Count  < 0) fprintf(stderr, "Warning: 'FindDefaultSmartByte()' function cant return correct value for 'Reallocated_Sectors_Count'. Result will be incorrect.\n");
     }
 
-    printf("  Seek_Error=%d\n", Seek_Error);
-    printf("  Reallocated_Sectors_Count=%d\n", Reallocated_Sectors_Count);
-    */
+    if (returned_status_warning){
+        if (!thresholds_warning) printf("not ok. Reasons:\n");
+        printf("    \'SMART RETURN STATUS\' command returned error status\n");
+    } else if (!thresholds_warning){
+        printf("ok.\n");
+    }
+
     printf("\n");
     close(fd);
 }
@@ -664,11 +648,13 @@ int NvmeScan(const char *path){
         return -1;
     }
 
+    /*--------------------------------------------------------------------Печать таблицы SMART
     printf("  SMART data:");
     for (int i = 0; i < SMART_DATA_SIZE_BYTES; i++) {
         if (i % 16 == 0) printf("\n    %03X: ", i);
         printf("%02X ", smart_log[i]);
     }
+    */
     printf("\n");
 
 
@@ -748,6 +734,7 @@ int NvmeScan(const char *path){
     memcpy(&olec, &smart_log[232], sizeof(olec));
     memcpy(&ipm, &smart_log[240], sizeof(ipm));
 
+    printf("  Critical Warning=                                 %hu\n", smart_log[0]);
     printf("  Composite Temperature=                            %hu\n", temperature);
     printf("  Available Spare=                                  %hu\n", smart_log[3]);
     printf("  Available Spare Threshold=                        %hu\n", smart_log[4]);
@@ -794,8 +781,17 @@ int NvmeScan(const char *path){
 
 
     printf("\n  SMART status: ");
-    if ((smart_log[0] & 0xFF) != 0x0){
-        printf("not ok.\n");
+    bool cw_warning = (smart_log[0] != 0);
+    bool egcws_warning = (smart_log[6] != 0);
+    bool as_warning = (smart_log[3] < smart_log[4]);
+
+    if (!cw_warning && !egcws_warning && !as_warning){
+        printf("ok.\n");
+    } else {
+        printf("not ok. Reasons:\n");
+    }
+
+    if (cw_warning){
         printf("    Critical Warning byte=0x%X. Problems:\n", smart_log[0]);
         
         if((smart_log[0] & 0x1) == 0x1){
@@ -819,9 +815,28 @@ int NvmeScan(const char *path){
         if((smart_log[0] & (0x1 << 6)) == 0x1){
             printf("      Indeterminate Personality State (IPS)\n");
         }
-    } else {
-        printf("ok.\n");
     }
+
+    if(egcws_warning){
+        printf("    Endurance Group Critical Warning Summary=0x%X. Problems:\n", smart_log[6]);
+
+        if(smart_log[6] & (0x1 << 0)){
+            printf("      Endurance Group Available Spare Capacity Below Threshold (EGASCBT)\n");
+        }
+        if(smart_log[6] & (0x1 << 2)){
+            printf("      Endurance Group Degraded Reliability (EGDR)\n");
+        }
+        if(smart_log[6] & (0x1 << 3)){
+            printf("      Endurance Group Read-Only (EGRO)\n");
+        }
+    }
+
+    if(as_warning){
+        printf("    Available Spare below threshold:\n");
+        printf("      Available Spare=           %hu\n", smart_log[3]);
+        printf("      Available Spare Threshold= %hu\n", smart_log[4]);
+    }
+
 
     printf("\n");
     close(fd);
